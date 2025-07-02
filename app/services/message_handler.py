@@ -3,7 +3,8 @@ import logging
 import os
 from app.domain.entities.interview import Interview, InterviewStatus
 from app.infrastructure.database.repositories.interview import InterviewRepository
-from app.infrastructure.whatsapp.client import WhatsAppClient
+from app.infrastructure.messaging.base import MessagingProvider
+from app.infrastructure.messaging.factory import MessagingProviderFactory
 from app.services.audio_processor import AudioProcessor
 from app.services.transcription import TranscriptionService
 from app.services.analysis import AnalysisService
@@ -14,9 +15,9 @@ logger = logging.getLogger(__name__)
 
 
 class MessageHandler:
-    def __init__(self):
+    def __init__(self, messaging_provider: MessagingProvider = None):
         self.interview_repo = InterviewRepository()
-        self.whatsapp = WhatsAppClient()
+        self.messaging_provider = messaging_provider or MessagingProviderFactory.get_default_provider()
         self.audio_processor = AudioProcessor(settings.AUDIO_CHUNK_MINUTES)
         self.transcription = TranscriptionService()
         self.analysis = AnalysisService()
@@ -53,7 +54,7 @@ class MessageHandler:
                 interview.mark_failed(str(e))
                 await self.interview_repo.update(interview)
                 
-                await self.whatsapp.send_text_message(
+                await self.messaging_provider.send_text_message(
                     interview.phone_number,
                     f"❌ Erro no processamento: {str(e)}"
                 )
@@ -61,19 +62,19 @@ class MessageHandler:
     async def _process_audio(self, interview: Interview):
         """Internal audio processing logic"""
         # Step 1: Download audio
-        await self.whatsapp.send_text_message(
+        await self.messaging_provider.send_text_message(
             interview.phone_number,
             "🎵 Baixando áudio..."
         )
         
-        audio_bytes = await self.whatsapp.download_media(interview.audio_id)
+        audio_bytes = await self.messaging_provider.download_media(interview.audio_id)
         if not audio_bytes:
             raise Exception("Failed to download audio")
         
         interview.audio_size_mb = len(audio_bytes) / (1024 * 1024)
         
         # Step 2: Convert and split
-        await self.whatsapp.send_text_message(
+        await self.messaging_provider.send_text_message(
             interview.phone_number,
             f"🔄 Convertendo e dividindo áudio ({interview.audio_size_mb:.1f}MB)\n📝 Transcrição com timestamps"
         )
@@ -101,7 +102,7 @@ class MessageHandler:
         interview.status = InterviewStatus.ANALYZING
         await self.interview_repo.update(interview)
         
-        await self.whatsapp.send_text_message(
+        await self.messaging_provider.send_text_message(
             interview.phone_number,
             "🧠 Gerando análise estruturada..."
         )
@@ -118,7 +119,7 @@ class MessageHandler:
         await self.interview_repo.update(interview)
         
         # Final message
-        await self.whatsapp.send_text_message(
+        await self.messaging_provider.send_text_message(
             interview.phone_number,
             f"🎉 Processamento completo! (ID: {interview.id[:8]})\n\n"
             f"📝 Transcrição: Com timestamps precisos\n"
@@ -131,14 +132,14 @@ class MessageHandler:
         interview.chunks_processed = chunk_num
         await self.interview_repo.update(interview)
         
-        await self.whatsapp.send_text_message(
+        await self.messaging_provider.send_text_message(
             interview.phone_number,
             f"🎙️ Transcrevendo chunk {chunk_num}/{interview.chunks_total}"
         )
     
     async def _create_and_send_documents(self, interview: Interview):
         """Create and send documents"""
-        await self.whatsapp.send_text_message(
+        await self.messaging_provider.send_text_message(
             interview.phone_number,
             "📄 Criando documentos..."
         )
@@ -152,9 +153,9 @@ class MessageHandler:
         
         try:
             # Upload and send transcript
-            transcript_media_id = await self.whatsapp.upload_media(transcript_path)
+            transcript_media_id = await self.messaging_provider.upload_media(transcript_path)
             if transcript_media_id:
-                await self.whatsapp.send_document(
+                await self.messaging_provider.send_document(
                     interview.phone_number,
                     transcript_media_id,
                     f"📝 TRANSCRIÇÃO (ID: {interview.id[:8]})",
@@ -163,9 +164,9 @@ class MessageHandler:
             
             # Upload and send analysis if available
             if interview.analysis and analysis_path:
-                analysis_media_id = await self.whatsapp.upload_media(analysis_path)
+                analysis_media_id = await self.messaging_provider.upload_media(analysis_path)
                 if analysis_media_id:
-                    await self.whatsapp.send_document(
+                    await self.messaging_provider.send_document(
                         interview.phone_number,
                         analysis_media_id,
                         f"📊 ANÁLISE (ID: {interview.id[:8]})",

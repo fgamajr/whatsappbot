@@ -3,14 +3,14 @@
 ==================================================
 
 .
-├── .dockerignore
+├── .claude
+│   └── settings.local.json
 ├── .env.example
 ├── .gitignore
+├── Dockerfile
 ├── README.md
 ├── app
-│   ├── __init__.py
 │   ├── api
-│   │   ├── __init__.py
 │   │   ├── middleware
 │   │   └── v1
 │   ├── core
@@ -19,15 +19,15 @@
 │   │   ├── exceptions.py
 │   │   └── logging.py
 │   ├── domain
-│   │   ├── __init__.py
 │   │   ├── entities
 │   │   └── value_objects
 │   ├── infrastructure
-│   │   ├── __init__.py
 │   │   ├── ai
 │   │   ├── database
+│   │   ├── messaging
 │   │   └── whatsapp
 │   ├── main.py
+│   ├── main.py.bak
 │   ├── prompts
 │   │   ├── __init__.py
 │   │   └── interview_analysis.py
@@ -37,21 +37,38 @@
 │   │   ├── audio_processor.py
 │   │   ├── document_generator.py
 │   │   ├── message_handler.py
+│   │   ├── recovery_service.py
 │   │   └── transcription.py
 │   └── utils
 │       └── __init__.py
+├── backup_20250627_163737
+│   └── app
+│       ├── api
+│       ├── core
+│       ├── domain
+│       ├── main.py
+│       ├── prompts
+│       └── services
 ├── docker
 │   └── Dockerfile
 ├── docker-compose.yml
+├── docs
+│   └── telegram_setup.md
 ├── fly.toml
 ├── gerar.sh
 ├── logs
+│   └── recovery.log
 ├── project_context.txt
+├── recovery.sh
 ├── requirements.txt
 ├── scripts
+│   ├── migrate_old_interviews.py
+│   ├── recovery.py
 │   ├── run.sh
 │   ├── setup.sh
-│   └── test.sh
+│   ├── setup_telegram.py
+│   ├── test.sh
+│   └── test_providers.py
 └── tests
     ├── __init__.py
     ├── e2e
@@ -63,13 +80,49 @@
         ├── __init__.py
         └── test_phone_number.py
 
-27 directories, 33 files
+33 directories, 44 files
 
 
 ==================================================
        CÓDIGO FONTE E ARQUIVOS DE CONFIGURAÇÃO    
 ==================================================
 
+# --------------------------------------------------
+# Arquivo: ./.claude/settings.local.json
+# --------------------------------------------------
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)"
+    ],
+    "deny": []
+  }
+}
+# --------------------------------------------------
+# Arquivo: ./Dockerfile
+# --------------------------------------------------
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+
+RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
+USER app
+
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health/live || exit 1
+
+CMD ["gunicorn", "app.main:app", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000"]
 # --------------------------------------------------
 # Arquivo: ./README.md
 # --------------------------------------------------
@@ -393,6 +446,315 @@ async def readiness():
     return health_status
 
 # --------------------------------------------------
+# Arquivo: ./app/api/v1/messaging.py
+# --------------------------------------------------
+from fastapi import APIRouter, Request, Response, BackgroundTasks
+from typing import Dict, Set
+import logging
+from app.services.message_handler import MessageHandler
+from app.infrastructure.messaging.factory import MessagingProviderFactory
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# Simple in-memory cache for duplicate detection
+processed_messages: Set[str] = set()
+
+
+@router.get("/whatsapp")
+async def verify_whatsapp_webhook(request: Request):
+    """Verify webhook with WhatsApp"""
+    provider = MessagingProviderFactory.create_provider("whatsapp")
+    
+    query_params = dict(request.query_params)
+    
+    if provider.validate_webhook({}, query_params):
+        challenge = query_params.get("hub.challenge", "")
+        logger.info("WhatsApp webhook verified successfully")
+        return Response(content=challenge, status_code=200)
+    else:
+        logger.warning("WhatsApp webhook verification failed")
+        return Response(status_code=403)
+
+
+@router.post("/whatsapp")
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    """WhatsApp webhook endpoint"""
+    return await _handle_webhook(request, background_tasks, "whatsapp")
+
+
+@router.post("/telegram")
+async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Telegram webhook endpoint"""
+    return await _handle_webhook(request, background_tasks, "telegram")
+
+
+async def _handle_webhook(request: Request, background_tasks: BackgroundTasks, provider_name: str):
+    """Generic webhook handler for any messaging provider"""
+    try:
+        data = await request.json()
+        provider = MessagingProviderFactory.create_provider(provider_name)
+        
+        # Validate webhook
+        if not provider.validate_webhook(data, {}):
+            return Response(status_code=200)
+        
+        # Extract message data
+        standard_message = provider.extract_message_data(data)
+        if not standard_message:
+            return Response(status_code=200)
+        
+        # Check for duplicates
+        message_id = standard_message.message_id
+        if message_id in processed_messages:
+            logger.info("Duplicate message ignored", extra={
+                "message_id": message_id,
+                "provider": provider_name
+            })
+            return Response(status_code=200)
+        
+        # Add to cache
+        processed_messages.add(message_id)
+        
+        # Clean cache if too large
+        if len(processed_messages) > settings.MAX_CACHE_SIZE:
+            processed_messages.clear()
+        
+        # Convert to legacy format for compatibility
+        message_data = standard_message.to_dict()
+        
+        # Handle different message types
+        if standard_message.message_type.value == "audio":
+            # Schedule background processing
+            handler = MessageHandler(provider)
+            background_tasks.add_task(handler.process_audio_message, message_data)
+            
+            logger.info("Audio processing scheduled", extra={
+                "message_id": message_id,
+                "from": standard_message.from_number,
+                "provider": provider_name
+            })
+        
+        elif standard_message.message_type.value == "text":
+            # Handle text commands immediately
+            await _handle_text_message(message_data, provider)
+        
+        return Response(status_code=200)
+        
+    except Exception as e:
+        logger.error("Webhook processing error", extra={
+            "error": str(e),
+            "provider": provider_name
+        })
+        return Response(status_code=500)
+
+
+async def _handle_text_message(message_data: Dict, provider):
+    """Handle text commands immediately"""
+    from_number = message_data["from"]
+    text = message_data["content"].lower().strip()
+    
+    if text in ["help", "ajuda", "/help"]:
+        help_message = """
+📋 *Bot de Relatório de Entrevistas* - Sistema Enterprise
+
+🎵 **Processamento em Background:**
+• Resposta imediata (<1s)
+• Processamento paralelo de áudios longos
+• Chunks otimizados de 15min
+• Progress updates em tempo real
+• Arquitetura limpa e escalável
+
+📄 **Você receberá 2 documentos:**
+1️⃣ **TRANSCRIÇÃO** - Texto completo com timestamps precisos
+2️⃣ **ANÁLISE** - Relatório estruturado profissional
+
+🎙️ **Transcrição:**
+• Timestamps precisos [MM:SS-MM:SS]
+• Texto completo sem identificação de locutores
+• Análise inteligente do contexto da conversa
+
+🚀 **Como usar:**
+Apenas envie o áudio da entrevista (QUALQUER duração)!
+
+💡 **Comandos úteis:**
+• `help` - Esta mensagem
+• `status` - Informações do sistema
+        """
+        await provider.send_text_message(from_number, help_message)
+    
+    elif text == "status":
+        status_message = f"""
+📊 *System Status*
+
+⚡ **Mode:** Background processing enabled
+🚀 **Architecture:** Clean & Scalable
+💾 **Cache:** {len(processed_messages)} messages processed
+🛡️ **Protection:** Anti-duplicate enabled
+🎙️ **Transcription:** Whisper + Timestamps
+🧠 **Analysis:** Gemini AI
+🗄️ **Database:** MongoDB Atlas
+
+🎵 **Transcrição:** Apenas timestamps (sem locutores)
+        """
+        await provider.send_text_message(from_number, status_message)
+    
+    else:
+        await provider.send_text_message(
+            from_number, 
+            "👋 Envie-me uma gravação de áudio de entrevista!\n⚡ Resposta imediata + processamento enterprise em background!\n🎙️ Transcrição com timestamps precisos"
+        )
+# --------------------------------------------------
+# Arquivo: ./app/api/v1/recovery.py
+# --------------------------------------------------
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from typing import Dict, List
+import logging
+from datetime import datetime, timedelta
+from app.services.recovery_service import RecoveryService
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.domain.entities.interview import InterviewStatus
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.post("/recovery/run")
+async def run_recovery(background_tasks: BackgroundTasks):
+    """Executa ciclo de recovery em background"""
+    try:
+        recovery_service = RecoveryService()
+        background_tasks.add_task(recovery_service.run_recovery_cycle)
+        
+        return {
+            "message": "Recovery cycle started in background",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error("Failed to start recovery cycle", extra={
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/recovery/status")
+async def get_recovery_status():
+    """Retorna status das entrevistas para monitoramento"""
+    try:
+        interview_repo = InterviewRepository()
+        collection = await interview_repo._get_collection()
+        
+        # Contar por status
+        pipeline = [
+            {"$group": {
+                "_id": "$status",
+                "count": {"$sum": 1}
+            }}
+        ]
+        
+        status_counts = {}
+        async for doc in collection.aggregate(pipeline):
+            status_counts[doc["_id"]] = doc["count"]
+        
+        # Buscar entrevistas órfãs
+        cutoff_time = datetime.now() - timedelta(minutes=60)
+        orphaned_count = await collection.count_documents({
+            "status": {
+                "$in": [
+                    InterviewStatus.PROCESSING,
+                    InterviewStatus.TRANSCRIBING,
+                    InterviewStatus.ANALYZING
+                ]
+            },
+            "started_at": {"$lt": cutoff_time}
+        })
+        
+        # Buscar entrevistas para retry
+        retry_cutoff = datetime.now() - timedelta(minutes=5)
+        retry_ready_count = await collection.count_documents({
+            "status": InterviewStatus.FAILED,
+            "retry_count": {"$lt": 3},
+            "last_retry_at": {"$lt": retry_cutoff}
+        })
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "status_counts": status_counts,
+            "orphaned_interviews": orphaned_count,
+            "retry_ready": retry_ready_count,
+            "total_interviews": sum(status_counts.values()) if status_counts else 0
+        }
+        
+    except Exception as e:
+        logger.error("Failed to get recovery status", extra={
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/recovery/orphaned")
+async def list_orphaned_interviews():
+    """Lista entrevistas órfãs para debugging"""
+    try:
+        recovery_service = RecoveryService()
+        orphaned = await recovery_service._find_orphaned_interviews()
+        
+        return {
+            "count": len(orphaned),
+            "interviews": [
+                {
+                    "id": interview.id,
+                    "phone_number": interview.phone_number,
+                    "status": interview.status,
+                    "started_at": interview.started_at.isoformat() if interview.started_at else None,
+                    "chunks_processed": interview.chunks_processed,
+                    "chunks_total": interview.chunks_total,
+                    "processing_time_minutes": (
+                        datetime.now() - interview.started_at
+                    ).total_seconds() / 60 if interview.started_at else 0
+                }
+                for interview in orphaned
+            ]
+        }
+        
+    except Exception as e:
+        logger.error("Failed to list orphaned interviews", extra={
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/recovery/interview/{interview_id}")
+async def force_retry_interview(interview_id: str, background_tasks: BackgroundTasks):
+    """Força retry de uma entrevista específica"""
+    try:
+        interview_repo = InterviewRepository()
+        interview = await interview_repo.get_by_id(interview_id)
+        
+        if not interview:
+            raise HTTPException(status_code=404, detail="Interview not found")
+        
+        recovery_service = RecoveryService()
+        background_tasks.add_task(recovery_service._retry_interview, interview)
+        
+        return {
+            "message": f"Retry scheduled for interview {interview_id}",
+            "interview_id": interview_id,
+            "current_status": interview.status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to force retry interview", extra={
+            "error": str(e),
+            "interview_id": interview_id
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --------------------------------------------------
 # Arquivo: ./app/api/v1/webhooks.py
 # --------------------------------------------------
 from fastapi import APIRouter, Request, Response, BackgroundTasks
@@ -562,9 +924,10 @@ async def _handle_text_message(message_data: Dict):
 1️⃣ **TRANSCRIÇÃO** - Texto completo com timestamps precisos
 2️⃣ **ANÁLISE** - Relatório estruturado profissional
 
-🎙️ **Modos de Transcrição:**
-• **Padrão:** Com identificação de locutores (ENTREVISTADOR/CANDIDATO)
-• **`/simples`:** Sem identificação de locutores (apenas timestamps)
+🎙️ **Transcrição:**
+• Timestamps precisos [MM:SS-MM:SS]
+• Texto completo sem identificação de locutores
+• Análise inteligente do contexto da conversa
 
 🚀 **Como usar:**
 Apenas envie o áudio da entrevista (QUALQUER duração)!
@@ -572,8 +935,6 @@ Apenas envie o áudio da entrevista (QUALQUER duração)!
 💡 **Comandos úteis:**
 • `help` - Esta mensagem
 • `status` - Informações do sistema
-• `/simples` - Ativar modo sem locutores
-• `/completo` - Ativar modo com locutores
         """
         await whatsapp.send_text_message(from_number, help_message)
     
@@ -585,21 +946,19 @@ Apenas envie o áudio da entrevista (QUALQUER duração)!
 🚀 **Architecture:** Clean & Scalable
 💾 **Cache:** {len(processed_messages)} messages processed
 🛡️ **Protection:** Anti-duplicate enabled
-🎙️ **Transcription:** Whisper + Gemini
+🎙️ **Transcription:** Whisper + Timestamps
+🧠 **Analysis:** Gemini AI
 🗄️ **Database:** MongoDB Atlas
 
-🔄 **Commands:**
-• `/completo` - Modo com locutores
-• `/simples` - Modo sem locutores
+🎵 **Transcrição:** Apenas timestamps (sem locutores)
         """
         await whatsapp.send_text_message(from_number, status_message)
     
     else:
         await whatsapp.send_text_message(
             from_number, 
-            "👋 Envie-me uma gravação de áudio de entrevista!\n⚡ Resposta imediata + processamento enterprise em background!"
+            "👋 Envie-me uma gravação de áudio de entrevista!\n⚡ Resposta imediata + processamento enterprise em background!\n🎙️ Transcrição com timestamps precisos"
         )
-
 # --------------------------------------------------
 # Arquivo: ./app/core/config.py
 # --------------------------------------------------
@@ -621,11 +980,17 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     ENVIRONMENT: str = "development"
     
+    # Messaging Providers
+    DEFAULT_MESSAGING_PROVIDER: str = "whatsapp"
+    
     # WhatsApp
     WHATSAPP_TOKEN: str
     WHATSAPP_VERIFY_TOKEN: str
     PHONE_NUMBER_ID: str
     WHATSAPP_API_VERSION: str = "v18.0"
+    
+    # Telegram
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
     
     # AI Services
     OPENAI_API_KEY: str
@@ -802,7 +1167,6 @@ class InterviewStatus(str, Enum):
     FAILED = "failed"
 
 
-
 class Interview(BaseModel):
     model_config = ConfigDict(use_enum_values=True)
     id: str = Field(default_factory=lambda: str(int(datetime.now().timestamp() * 1000)))
@@ -832,12 +1196,11 @@ class Interview(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
-    
-    # User preferences
-    simple_mode: bool = False
-    
-
         
+    # Recovery fields
+    retry_count: int = 0
+    last_retry_at: Optional[datetime] = None
+
     def mark_processing(self):
         self.status = InterviewStatus.PROCESSING
         self.started_at = datetime.now()
@@ -850,7 +1213,6 @@ class Interview(BaseModel):
         self.status = InterviewStatus.FAILED
         self.error = error
         self.completed_at = datetime.now()
-
 # --------------------------------------------------
 # Arquivo: ./app/domain/value_objects/phone_number.py
 # --------------------------------------------------
@@ -1266,6 +1628,706 @@ class InterviewRepository:
             return 0
 
 # --------------------------------------------------
+# Arquivo: ./app/infrastructure/messaging/base.py
+# --------------------------------------------------
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any
+from enum import Enum
+
+
+class MessageType(Enum):
+    TEXT = "text"
+    AUDIO = "audio"
+    DOCUMENT = "document"
+
+
+class MessagingProvider(ABC):
+    """Abstract base class for messaging service providers"""
+    
+    @abstractmethod
+    async def send_text_message(self, to: str, message: str) -> bool:
+        """Send a text message"""
+        pass
+    
+    @abstractmethod
+    async def download_media(self, media_id: str) -> Optional[bytes]:
+        """Download media file"""
+        pass
+    
+    @abstractmethod
+    async def upload_media(self, file_path: str) -> Optional[str]:
+        """Upload media file and return media ID"""
+        pass
+    
+    @abstractmethod
+    async def send_document(self, to: str, media_id: str, caption: str, filename: str) -> bool:
+        """Send a document message"""
+        pass
+    
+    @abstractmethod
+    def extract_message_data(self, webhook_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract standardized message data from provider-specific webhook"""
+        pass
+    
+    @abstractmethod
+    def validate_webhook(self, request_data: Dict[str, Any], query_params: Dict[str, str]) -> bool:
+        """Validate webhook request"""
+        pass
+
+
+class StandardMessage:
+    """Standardized message format across all providers"""
+    
+    def __init__(self, from_number: str, message_type: MessageType, message_id: str, 
+                 timestamp: Optional[str] = None, content: Optional[str] = None, 
+                 media_id: Optional[str] = None):
+        self.from_number = from_number
+        self.message_type = message_type
+        self.message_id = message_id
+        self.timestamp = timestamp
+        self.content = content
+        self.media_id = media_id
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "from": self.from_number,
+            "type": self.message_type.value,
+            "message_id": self.message_id,
+            "timestamp": self.timestamp,
+            "content": self.content,
+            "media_id": self.media_id
+        }
+# --------------------------------------------------
+# Arquivo: ./app/infrastructure/messaging/factory.py
+# --------------------------------------------------
+from typing import Dict, Type
+from app.infrastructure.messaging.base import MessagingProvider
+from app.infrastructure.messaging.whatsapp.client import WhatsAppProvider
+from app.infrastructure.messaging.telegram.client import TelegramProvider
+from app.core.config import settings
+
+
+class MessagingProviderFactory:
+    """Factory for creating messaging provider instances"""
+    
+    _providers: Dict[str, Type[MessagingProvider]] = {
+        "whatsapp": WhatsAppProvider,
+        "telegram": TelegramProvider
+    }
+    
+    @classmethod
+    def create_provider(cls, provider_name: str) -> MessagingProvider:
+        """Create a messaging provider instance"""
+        provider_class = cls._providers.get(provider_name.lower())
+        if not provider_class:
+            raise ValueError(f"Unknown messaging provider: {provider_name}")
+        
+        return provider_class()
+    
+    @classmethod
+    def get_default_provider(cls) -> MessagingProvider:
+        """Get the default messaging provider based on configuration"""
+        default_provider = getattr(settings, 'DEFAULT_MESSAGING_PROVIDER', 'whatsapp')
+        return cls.create_provider(default_provider)
+    
+    @classmethod
+    def get_available_providers(cls) -> list[str]:
+        """Get list of available provider names"""
+        return list(cls._providers.keys())
+    
+    @classmethod
+    def register_provider(cls, name: str, provider_class: Type[MessagingProvider]):
+        """Register a new messaging provider"""
+        cls._providers[name.lower()] = provider_class
+# --------------------------------------------------
+# Arquivo: ./app/infrastructure/messaging/telegram/client.py
+# --------------------------------------------------
+import aiohttp
+import os
+from typing import Optional, Dict, Any
+import logging
+import traceback
+from app.core.config import settings
+from app.infrastructure.messaging.base import MessagingProvider, MessageType, StandardMessage
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramProvider(MessagingProvider):
+    def __init__(self):
+        self.token = settings.TELEGRAM_BOT_TOKEN
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+        
+    async def send_text_message(self, to: str, message: str) -> bool:
+        """Send text message via Telegram"""
+        try:
+            url = f"{self.base_url}/sendMessage"
+            
+            data = {
+                "chat_id": to,
+                "text": message,
+                "parse_mode": "Markdown"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=data) as response:
+                    if response.status == 200:
+                        logger.info("Text message sent", extra={
+                            "chat_id": to,
+                            "message_length": len(message)
+                        })
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error("Failed to send text message", extra={
+                            "status": response.status,
+                            "error": error_text,
+                            "chat_id": to
+                        })
+                        return False
+                        
+        except Exception as e:
+            logger.error("Error sending text message", extra={
+                "error": str(e),
+                "chat_id": to
+            })
+            traceback.print_exc()
+            return False
+    
+    async def download_media(self, media_id: str) -> Optional[bytes]:
+        """Download media file from Telegram"""
+        try:
+            # First, get the file path
+            url = f"{self.base_url}/getFile"
+            params = {"file_id": media_id}
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error("Failed to get file path", extra={
+                            "file_id": media_id,
+                            "status": response.status,
+                            "error": error_text
+                        })
+                        return None
+                    
+                    file_data = await response.json()
+                    if not file_data.get("ok"):
+                        logger.error("Telegram API error", extra={
+                            "file_id": media_id,
+                            "error": file_data.get("description")
+                        })
+                        return None
+                    
+                    file_path = file_data["result"]["file_path"]
+                
+                # Download the actual file
+                download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+                async with session.get(download_url) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        logger.info("Media downloaded", extra={
+                            "file_id": media_id,
+                            "size_bytes": len(content)
+                        })
+                        return content
+                    else:
+                        error_text = await response.text()
+                        logger.error("Failed to download media", extra={
+                            "file_id": media_id,
+                            "status": response.status,
+                            "error": error_text
+                        })
+                        return None
+                        
+        except Exception as e:
+            logger.error("Error downloading media", extra={
+                "error": str(e),
+                "file_id": media_id
+            })
+            traceback.print_exc()
+            return None
+    
+    async def upload_media(self, file_path: str) -> Optional[str]:
+        """Upload media file to Telegram (not needed for sending documents)"""
+        # Telegram doesn't require separate upload step like WhatsApp
+        # We'll return the file path as the "media_id" for consistency
+        if os.path.exists(file_path):
+            return file_path
+        return None
+    
+    async def send_document(self, to: str, media_id: str, caption: str, filename: str) -> bool:
+        """Send document message via Telegram"""
+        try:
+            url = f"{self.base_url}/sendDocument"
+            
+            # For Telegram, media_id is actually the file path
+            file_path = media_id
+            
+            if not os.path.exists(file_path):
+                logger.error("File not found", extra={"file_path": file_path})
+                return False
+            
+            logger.info("Attempting to send document", extra={
+                "chat_id": to,
+                "file_path": file_path,
+                "document_filename": filename,
+                "caption_length": len(caption) if caption else 0
+            })
+            
+            async with aiohttp.ClientSession() as session:
+                data = aiohttp.FormData()
+                data.add_field('chat_id', to)
+                data.add_field('caption', caption)
+                
+                with open(file_path, 'rb') as f:
+                    data.add_field('document', f, filename=filename)
+                    
+                    async with session.post(url, data=data) as response:
+                        response_text = await response.text()
+                        
+                        if response.status == 200:
+                            response_json = await response.json()
+                            if response_json.get("ok"):
+                                logger.info("Document sent successfully", extra={
+                                    "chat_id": to,
+                                    "file_path": file_path,
+                                    "document_filename": filename
+                                })
+                                return True
+                            else:
+                                logger.error("Telegram API error", extra={
+                                    "chat_id": to,
+                                    "error": response_json.get("description"),
+                                    "response": response_text
+                                })
+                                return False
+                        else:
+                            logger.error("Failed to send document", extra={
+                                "status": response.status,
+                                "error": response_text,
+                                "chat_id": to,
+                                "file_path": file_path
+                            })
+                            return False
+                        
+        except Exception as e:
+            print("\n\n================================================")
+            print(">>> ERRO INESPERADO DURANTE O ENVIO DO DOCUMENTO TELEGRAM <<<")
+            traceback.print_exc()
+            print("================================================\n\n")
+            
+            logger.error("Error sending document", extra={
+                "error": str(e),
+                "chat_id": to,
+                "file_path": media_id
+            })
+            return False
+
+    def extract_message_data(self, webhook_data: Dict[str, Any]) -> Optional[StandardMessage]:
+        """Extract standardized message data from Telegram webhook"""
+        try:
+            message = webhook_data.get("message")
+            if not message:
+                return None
+            
+            message_id = str(message["message_id"])
+            chat_id = str(message["chat"]["id"])
+            timestamp = str(message.get("date", ""))
+            
+            # Check message type
+            if "voice" in message:
+                # Voice message
+                message_type = MessageType.AUDIO
+                media_id = message["voice"]["file_id"]
+                content = None
+            elif "audio" in message:
+                # Audio file
+                message_type = MessageType.AUDIO
+                media_id = message["audio"]["file_id"]
+                content = None
+            elif "text" in message:
+                # Text message
+                message_type = MessageType.TEXT
+                media_id = None
+                content = message["text"]
+            else:
+                return None  # Unsupported message type
+            
+            return StandardMessage(
+                from_number=chat_id,
+                message_type=message_type,
+                message_id=message_id,
+                timestamp=timestamp,
+                content=content,
+                media_id=media_id
+            )
+            
+        except (KeyError, TypeError) as e:
+            logger.error("Error extracting Telegram message data", extra={
+                "error": str(e)
+            })
+            return None
+
+    def validate_webhook(self, request_data: Dict[str, Any], query_params: Dict[str, str]) -> bool:
+        """Validate Telegram webhook request"""
+        # Basic validation for Telegram webhook
+        try:
+            # Check if it's a message update
+            if "message" in request_data:
+                message = request_data["message"]
+                return "chat" in message and "message_id" in message
+            return False
+            
+        except (KeyError, TypeError):
+            return False
+# --------------------------------------------------
+# Arquivo: ./app/infrastructure/messaging/whatsapp/client.py
+# --------------------------------------------------
+import aiohttp
+import os
+from typing import Optional, Dict, Any
+import logging
+import traceback
+from app.core.config import settings
+from app.core.exceptions import WhatsAppError
+from app.infrastructure.messaging.base import MessagingProvider, MessageType, StandardMessage
+from app.domain.value_objects.phone_number import BrazilianPhoneNumber
+
+logger = logging.getLogger(__name__)
+
+
+class WhatsAppProvider(MessagingProvider):
+    def __init__(self):
+        self.token = settings.WHATSAPP_TOKEN
+        self.phone_number_id = settings.PHONE_NUMBER_ID
+        self.api_version = settings.WHATSAPP_API_VERSION
+        self.base_url = f"https://graph.facebook.com/{self.api_version}"
+        
+    async def send_text_message(self, to: str, message: str) -> bool:
+        """Send text message via WhatsApp"""
+        try:
+            url = f"{self.base_url}/{self.phone_number_id}/messages"
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": message}
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=data, headers=headers) as response:
+                    if response.status == 200:
+                        logger.info("Text message sent", extra={
+                            "to_number": to,
+                            "message_length": len(message)
+                        })
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error("Failed to send text message", extra={
+                            "status": response.status,
+                            "error": error_text,
+                            "to_number": to
+                        })
+                        return False
+                        
+        except Exception as e:
+            logger.error("Error sending text message", extra={
+                "error": str(e),
+                "to_number": to
+            })
+            traceback.print_exc()
+            return False
+    
+    async def download_media(self, media_id: str) -> Optional[bytes]:
+        """Download media file from WhatsApp"""
+        try:
+            # First, get the media URL
+            url = f"{self.base_url}/{media_id}"
+            headers = {"Authorization": f"Bearer {self.token}"}
+            
+            async with aiohttp.ClientSession() as session:
+                # Get media URL
+                async with session.get(url, headers=headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error("Failed to get media URL", extra={
+                            "media_id": media_id,
+                            "status": response.status,
+                            "error": error_text
+                        })
+                        return None
+                    
+                    media_data = await response.json()
+                    media_url = media_data.get("url")
+                    
+                    if not media_url:
+                        logger.error("No media URL in response", extra={
+                            "media_id": media_id,
+                            "response_data": media_data
+                        })
+                        return None
+                
+                # Download the actual media file
+                async with session.get(media_url, headers=headers) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        logger.info("Media downloaded", extra={
+                            "media_id": media_id,
+                            "size_bytes": len(content)
+                        })
+                        return content
+                    else:
+                        error_text = await response.text()
+                        logger.error("Failed to download media", extra={
+                            "media_id": media_id,
+                            "status": response.status,
+                            "error": error_text
+                        })
+                        return None
+                        
+        except Exception as e:
+            logger.error("Error downloading media", extra={
+                "error": str(e),
+                "media_id": media_id
+            })
+            traceback.print_exc()
+            return None
+    
+    async def upload_media(self, file_path: str) -> Optional[str]:
+        """Upload media file to WhatsApp using aiohttp"""
+        try:
+            url = f"{self.base_url}/{self.phone_number_id}/media"
+            headers = {"Authorization": f"Bearer {self.token}"}
+            
+            # Verificar se o arquivo existe
+            if not os.path.exists(file_path):
+                logger.error("File not found", extra={"file_path": file_path})
+                return None
+            
+            file_name = os.path.basename(file_path)
+            
+            # Determinar o MIME type baseado na extensão do arquivo
+            mime_type_map = {
+                '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                '.pdf': 'application/pdf',
+                '.txt': 'text/plain',
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.mp3': 'audio/mpeg',
+                '.mp4': 'video/mp4',
+                '.wav': 'audio/wav',
+                '.ogg': 'audio/ogg'
+            }
+            
+            file_extension = os.path.splitext(file_path)[1].lower()
+            mime_type = mime_type_map.get(file_extension, 'application/octet-stream')
+            
+            # Usar aiohttp para upload assíncrono
+            async with aiohttp.ClientSession() as session:
+                # Criar o FormData para multipart/form-data
+                data = aiohttp.FormData()
+                
+                # Adicionar campos de metadados
+                data.add_field('messaging_product', 'whatsapp')
+                data.add_field('type', 'document')
+                
+                # Adicionar o arquivo
+                with open(file_path, 'rb') as f:
+                    data.add_field('file', f, filename=file_name, content_type=mime_type)
+                    
+                    async with session.post(url, headers=headers, data=data) as response:
+                        response_text = await response.text()
+                        
+                        if response.status == 200:
+                            try:
+                                response_json = await response.json()
+                                media_id = response_json.get("id")
+                                
+                                if media_id:
+                                    logger.info("Media uploaded successfully", extra={
+                                        "file_path": file_path,
+                                        "media_id": media_id,
+                                        "file_size": os.path.getsize(file_path),
+                                        "mime_type": mime_type
+                                    })
+                                    return media_id
+                                else:
+                                    logger.error("No media ID in response", extra={
+                                        "file_path": file_path,
+                                        "response": response_text
+                                    })
+                                    return None
+                                    
+                            except Exception as json_error:
+                                logger.error("Failed to parse JSON response", extra={
+                                    "file_path": file_path,
+                                    "response": response_text,
+                                    "json_error": str(json_error)
+                                })
+                                return None
+                        else:
+                            logger.error("Failed to upload media", extra={
+                                "file_path": file_path,
+                                "status": response.status,
+                                "response": response_text
+                            })
+                            return None
+                        
+        except Exception as e:
+            print("\n\n================================================")
+            print(">>> ERRO INESPERADO DURANTE O UPLOAD PARA WHATSAPP <<<")
+            traceback.print_exc()
+            print("================================================\n\n")
+            
+            logger.error("Error uploading media", extra={
+                "error": str(e),
+                "file_path": file_path
+            })
+            return None
+    
+    async def send_document(self, to: str, media_id: str, caption: str, filename: str) -> bool:
+        """Send document message via WhatsApp"""
+        try:
+            url = f"{self.base_url}/{self.phone_number_id}/messages"
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "document",
+                "document": {
+                    "id": media_id,
+                    "caption": caption,
+                    "filename": filename
+                }
+            }
+            
+            logger.info("Attempting to send document", extra={
+                "to_number": to,
+                "media_id": media_id,
+                "document_filename": filename,
+                "caption_length": len(caption) if caption else 0
+            })
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=data, headers=headers) as response:
+                    response_text = await response.text()
+                    
+                    if response.status == 200:
+                        logger.info("Document sent successfully", extra={
+                            "to_number": to,
+                            "media_id": media_id,
+                            "document_filename": filename
+                        })
+                        return True
+                    else:
+                        logger.error("Failed to send document", extra={
+                            "status": response.status,
+                            "error": response_text,
+                            "to_number": to,
+                            "media_id": media_id,
+                            "request_data": data
+                        })
+                        return False
+                        
+        except Exception as e:
+            print("\n\n================================================")
+            print(">>> ERRO INESPERADO DURANTE O ENVIO DO DOCUMENTO <<<")
+            traceback.print_exc()
+            print("================================================\n\n")
+            
+            logger.error("Error sending document", extra={
+                "error": str(e),
+                "to_number": to,
+                "media_id": media_id
+            })
+            return False
+
+    def extract_message_data(self, webhook_data: Dict[str, Any]) -> Optional[StandardMessage]:
+        """Extract standardized message data from WhatsApp webhook"""
+        try:
+            messages = webhook_data["entry"][0]["changes"][0]["value"]["messages"][0]
+            
+            message_id = messages["id"]
+            message_type_str = messages["type"]
+            from_number = messages["from"]
+            timestamp = messages.get("timestamp")
+            
+            # Validate and fix phone number
+            try:
+                phone = BrazilianPhoneNumber(number=from_number)
+                from_number = phone.number
+            except:
+                pass  # Use original number if validation fails
+            
+            # Convert to standard message type
+            if message_type_str == "audio":
+                message_type = MessageType.AUDIO
+                media_id = messages["audio"]["id"]
+                content = None
+            elif message_type_str == "text":
+                message_type = MessageType.TEXT
+                media_id = None
+                content = messages["text"]["body"]
+            else:
+                return None  # Unsupported message type
+            
+            return StandardMessage(
+                from_number=from_number,
+                message_type=message_type,
+                message_id=message_id,
+                timestamp=timestamp,
+                content=content,
+                media_id=media_id
+            )
+            
+        except (KeyError, IndexError) as e:
+            logger.error("Error extracting WhatsApp message data", extra={
+                "error": str(e)
+            })
+            return None
+
+    def validate_webhook(self, request_data: Dict[str, Any], query_params: Dict[str, str]) -> bool:
+        """Validate WhatsApp webhook request"""
+        # For verification requests
+        if query_params.get("hub.mode") == "subscribe":
+            return query_params.get("hub.verify_token") == settings.WHATSAPP_VERIFY_TOKEN
+        
+        # For message webhooks, check if it contains valid message data
+        try:
+            entry = request_data.get("entry", [])
+            if not entry:
+                return False
+                
+            changes = entry[0].get("changes", [])
+            if not changes:
+                return False
+                
+            value = changes[0].get("value", {})
+            
+            # Ignore status updates
+            if "statuses" in value:
+                return False
+            
+            # Check for messages
+            messages = value.get("messages", [])
+            return bool(messages)
+            
+        except (IndexError, KeyError):
+            return False
+# --------------------------------------------------
 # Arquivo: ./app/infrastructure/whatsapp/client.py
 # --------------------------------------------------
 import aiohttp
@@ -1542,7 +2604,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import logging
 
-from app.api.v1 import webhooks, health
+from app.api.v1 import webhooks, health, messaging
 from app.api.middleware.error_handler import ErrorHandlerMiddleware
 from app.core.config import settings
 from app.core.logging import setup_logging
@@ -1581,7 +2643,17 @@ app.add_middleware(ErrorHandlerMiddleware)
 
 # Routes
 app.include_router(health.router, prefix="/health", tags=["health"])
-app.include_router(webhooks.router, prefix="/webhook", tags=["whatsapp"])
+app.include_router(webhooks.router, prefix="/webhook", tags=["whatsapp"])  # Legacy WhatsApp endpoint
+app.include_router(messaging.router, prefix="/webhook", tags=["messaging"])  # New multi-provider endpoints
+
+
+# Recovery routes
+try:
+    from app.api.v1.recovery import router as recovery_router
+    app.include_router(recovery_router, prefix="", tags=["recovery"])
+    logger.info("Recovery endpoints enabled")
+except ImportError as e:
+    logger.warning("Recovery endpoints not available", extra={"error": str(e)})
 
 
 @app.get("/")
@@ -1613,28 +2685,28 @@ if __name__ == "__main__":
 # Arquivo: ./app/prompts/interview_analysis.py
 # --------------------------------------------------
 INTERVIEW_ANALYSIS_PROMPT = """
-Com base APENAS na transcrição da entrevista fornecida (que inclui identificação de ENTREVISTADOR e CANDIDATO), gere um relatório abrangente que responda às seguintes questões.
+Com base APENAS na transcrição da entrevista fornecida (que contém timestamps e diálogos), gere um relatório abrangente que responda às seguintes questões.
 Estruture a saída com títulos claros para cada questão. Seja detalhado, mas conciso. Responda em PORTUGUÊS.
 
-APROVEITE a separação entre ENTREVISTADOR e CANDIDATO para fazer uma análise mais precisa das respostas do candidato.
+IMPORTANTE: A transcrição contém apenas timestamps [MM:SS-MM:SS] seguidos do texto falado. Analise o conteúdo para identificar as diferentes vozes e o contexto da entrevista.
 
 1. **Experiência Profissional e Conquistas:**
-   - Resuma a trajetória profissional do candidato, incluindo cargos principais, empresas e progressão na carreira
-   - Destaque as conquistas, projetos ou realizações mais significativas mencionadas pelo CANDIDATO
+   - Resuma a trajetória profissional mencionada na entrevista, incluindo cargos principais, empresas e progressão na carreira
+   - Destaque as conquistas, projetos ou realizações mais significativas relatadas
    - Anote quaisquer certificações, educação ou habilidades técnicas relevantes discutidas
-   - Inclua exemplos específicos que o candidato forneceu
+   - Inclua exemplos específicos fornecidos durante a conversa
 
 2. **Histórico Pessoal:**
-   - Descreva o histórico pessoal relevante, motivações ou experiências de vida que o CANDIDATO compartilhou
-   - Inclua interesses pessoais, valores ou circunstâncias que possam ser relevantes para seu perfil profissional
-   - Anote quaisquer desafios superados ou perspectivas únicas mencionadas pelo candidato
+   - Descreva o histórico pessoal relevante, motivações ou experiências de vida compartilhadas
+   - Inclua interesses pessoais, valores ou circunstâncias que possam ser relevantes para o perfil profissional
+   - Anote quaisquer desafios superados ou perspectivas únicas mencionadas
 
 3. **Avaliação de Personalidade e Habilidades:**
-   - Com base na linguagem, tom e exemplos fornecidos pelo CANDIDATO, identifique os principais traços de personalidade
+   - Com base na linguagem, tom e exemplos fornecidos, identifique os principais traços de personalidade
    - Avalie habilidades interpessoais como estilo de comunicação, abordagem de resolução de problemas, capacidades de trabalho em equipe
-   - Anote qualidades de liderança, adaptabilidade e outros indicadores comportamentais observados nas respostas
-   - Inclua exemplos específicos da transcrição (citando falas do CANDIDATO) que apoiem essas avaliações
-   - Observe como o candidato responde às perguntas do ENTREVISTADOR
+   - Anote qualidades de liderança, adaptabilidade e outros indicadores comportamentais observados
+   - Inclua exemplos específicos da transcrição que apoiem essas avaliações
+   - Observe a qualidade das respostas e a estrutura do pensamento demonstrada
 
 4. **Pontos Fortes e Áreas de Desenvolvimento:**
    - Liste os principais pontos fortes identificados com base na entrevista
@@ -1642,13 +2714,18 @@ APROVEITE a separação entre ENTREVISTADOR e CANDIDATO para fazer uma análise 
    - Forneça recomendações específicas baseadas no perfil apresentado
 
 5. **Adequação Cultural e Motivacional:**
-   - Avalie a motivação do candidato para a posição/empresa
+   - Avalie a motivação para a posição/empresa discutida
    - Identifique valores e características que podem indicar boa adequação cultural
    - Analise expectativas de carreira e alinhamento com objetivos organizacionais
 
-Certifique-se de que todas as informações vêm diretamente da transcrição e evite fazer suposições além do que foi explicitamente discutido pelo CANDIDATO.
-"""
+6. **Impressões Gerais:**
+   - Forneça uma avaliação geral do candidato baseada na entrevista
+   - Destaque aspectos únicos ou diferenciadores observados
+   - Inclua recomendações finais sobre o perfil apresentado
 
+Certifique-se de que todas as informações vêm diretamente da transcrição e evite fazer suposições além do que foi explicitamente discutido.
+Analise o contexto e o fluxo da conversa para distinguir entre perguntas e respostas, mesmo sem identificação explícita de locutores.
+"""
 # --------------------------------------------------
 # Arquivo: ./app/services/analysis.py
 # --------------------------------------------------
@@ -1918,6 +2995,1017 @@ import logging
 import os
 from app.domain.entities.interview import Interview, InterviewStatus
 from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.infrastructure.messaging.base import MessagingProvider
+from app.infrastructure.messaging.factory import MessagingProviderFactory
+from app.services.audio_processor import AudioProcessor
+from app.services.transcription import TranscriptionService
+from app.services.analysis import AnalysisService
+from app.services.document_generator import DocumentGenerator
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class MessageHandler:
+    def __init__(self, messaging_provider: MessagingProvider = None):
+        self.interview_repo = InterviewRepository()
+        self.messaging_provider = messaging_provider or MessagingProviderFactory.get_default_provider()
+        self.audio_processor = AudioProcessor(settings.AUDIO_CHUNK_MINUTES)
+        self.transcription = TranscriptionService()
+        self.analysis = AnalysisService()
+        self.doc_generator = DocumentGenerator()
+    
+    async def process_audio_message(self, message_data: Dict):
+        """Process audio message with full error handling"""
+        interview = None
+        
+        try:
+            # Create interview record
+            interview = Interview(
+                phone_number=message_data["from"],
+                message_id=message_data["message_id"],
+                audio_id=message_data["media_id"]
+            )
+            
+            await self.interview_repo.create(interview)
+            
+            # Update status
+            interview.mark_processing()
+            await self.interview_repo.update(interview)
+            
+            # Process audio
+            await self._process_audio(interview)
+            
+        except Exception as e:
+            logger.error("Audio processing failed", extra={
+                "error": str(e),
+                "interview_id": interview.id if interview else "unknown"
+            })
+            
+            if interview:
+                interview.mark_failed(str(e))
+                await self.interview_repo.update(interview)
+                
+                await self.messaging_provider.send_text_message(
+                    interview.phone_number,
+                    f"❌ Erro no processamento: {str(e)}"
+                )
+    
+    async def _process_audio(self, interview: Interview):
+        """Internal audio processing logic"""
+        # Step 1: Download audio
+        await self.messaging_provider.send_text_message(
+            interview.phone_number,
+            "🎵 Baixando áudio..."
+        )
+        
+        audio_bytes = await self.messaging_provider.download_media(interview.audio_id)
+        if not audio_bytes:
+            raise Exception("Failed to download audio")
+        
+        interview.audio_size_mb = len(audio_bytes) / (1024 * 1024)
+        
+        # Step 2: Convert and split
+        await self.messaging_provider.send_text_message(
+            interview.phone_number,
+            f"🔄 Convertendo e dividindo áudio ({interview.audio_size_mb:.1f}MB)\n📝 Transcrição com timestamps"
+        )
+        
+        mp3_bytes = self.audio_processor.convert_to_mp3(audio_bytes)
+        chunks = self.audio_processor.split_into_chunks(mp3_bytes)
+        
+        interview.chunks_total = len(chunks)
+        await self.interview_repo.update(interview)
+        
+        # Step 3: Transcribe
+        interview.status = InterviewStatus.TRANSCRIBING
+        await self.interview_repo.update(interview)
+        
+        transcript = await self.transcription.transcribe_chunks(
+            chunks, interview, self._update_progress
+        )
+        
+        if not transcript:
+            raise Exception("Transcription failed")
+        
+        interview.transcript = transcript
+        
+        # Step 4: Generate analysis
+        interview.status = InterviewStatus.ANALYZING
+        await self.interview_repo.update(interview)
+        
+        await self.messaging_provider.send_text_message(
+            interview.phone_number,
+            "🧠 Gerando análise estruturada..."
+        )
+        
+        analysis = await self.analysis.generate_report(transcript)
+        if analysis:
+            interview.analysis = analysis
+        
+        # Step 5: Create and send documents
+        await self._create_and_send_documents(interview)
+        
+        # Mark completed
+        interview.mark_completed()
+        await self.interview_repo.update(interview)
+        
+        # Final message
+        await self.messaging_provider.send_text_message(
+            interview.phone_number,
+            f"🎉 Processamento completo! (ID: {interview.id[:8]})\n\n"
+            f"📝 Transcrição: Com timestamps precisos\n"
+            f"📄 {2 if analysis else 1} documento(s) enviado(s)\n"
+            f"⏱️ Processamento em background concluído!"
+        )
+    
+    async def _update_progress(self, interview: Interview, chunk_num: int):
+        """Update processing progress"""
+        interview.chunks_processed = chunk_num
+        await self.interview_repo.update(interview)
+        
+        await self.messaging_provider.send_text_message(
+            interview.phone_number,
+            f"🎙️ Transcrevendo chunk {chunk_num}/{interview.chunks_total}"
+        )
+    
+    async def _create_and_send_documents(self, interview: Interview):
+        """Create and send documents"""
+        await self.messaging_provider.send_text_message(
+            interview.phone_number,
+            "📄 Criando documentos..."
+        )
+        
+        # Create transcript document
+        transcript_path, analysis_path = self.doc_generator.create_documents(
+            interview.transcript,
+            interview.analysis or "Análise não disponível",
+            interview.id
+        )
+        
+        try:
+            # Upload and send transcript
+            transcript_media_id = await self.messaging_provider.upload_media(transcript_path)
+            if transcript_media_id:
+                await self.messaging_provider.send_document(
+                    interview.phone_number,
+                    transcript_media_id,
+                    f"📝 TRANSCRIÇÃO (ID: {interview.id[:8]})",
+                    f"transcricao_{interview.id[:8]}.docx"
+                )
+            
+            # Upload and send analysis if available
+            if interview.analysis and analysis_path:
+                analysis_media_id = await self.messaging_provider.upload_media(analysis_path)
+                if analysis_media_id:
+                    await self.messaging_provider.send_document(
+                        interview.phone_number,
+                        analysis_media_id,
+                        f"📊 ANÁLISE (ID: {interview.id[:8]})",
+                        f"analise_{interview.id[:8]}.docx"
+                    )
+            
+        finally:
+            # Clean up files
+            for path in [transcript_path, analysis_path]:
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except:
+                    pass
+# --------------------------------------------------
+# Arquivo: ./app/services/recovery_service.py
+# --------------------------------------------------
+from datetime import datetime, timedelta
+from typing import List, Optional
+import logging
+import asyncio
+from app.domain.entities.interview import Interview, InterviewStatus
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.services.message_handler import MessageHandler
+from app.infrastructure.whatsapp.client import WhatsAppClient
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class RecoveryService:
+    """
+    Serviço para recuperar entrevistas órfãs e com falhas
+    """
+    
+    def __init__(self):
+        self.interview_repo = InterviewRepository()
+        self.whatsapp = WhatsAppClient()
+        self.message_handler = MessageHandler()
+        
+        # Configurações de recovery
+        self.max_processing_time_minutes = 60  # Considera órfã após 1 hora
+        self.max_retry_attempts = 3
+        self.retry_delay_minutes = 5
+    
+    async def run_recovery_cycle(self):
+        """
+        Executa um ciclo completo de recuperação
+        """
+        logger.info("Starting recovery cycle")
+        
+        try:
+            # Buscar entrevistas órfãs
+            orphaned_interviews = await self._find_orphaned_interviews()
+            
+            if orphaned_interviews:
+                logger.info("Found orphaned interviews", extra={
+                    "count": len(orphaned_interviews)
+                })
+                
+                for interview in orphaned_interviews:
+                    await self._recover_interview(interview)
+            
+            # Buscar entrevistas para retry
+            retry_interviews = await self._find_retry_candidates()
+            
+            if retry_interviews:
+                logger.info("Found interviews ready for retry", extra={
+                    "count": len(retry_interviews)
+                })
+                
+                for interview in retry_interviews:
+                    await self._retry_interview(interview)
+            
+            logger.info("Recovery cycle completed")
+            
+        except Exception as e:
+            logger.error("Recovery cycle failed", extra={
+                "error": str(e)
+            })
+    
+    async def _find_orphaned_interviews(self) -> List[Interview]:
+        """
+        Encontra entrevistas órfãs (processando há muito tempo)
+        """
+        try:
+            collection = await self.interview_repo._get_collection()
+            
+            # Buscar entrevistas em processamento há mais de X minutos
+            cutoff_time = datetime.now() - timedelta(minutes=self.max_processing_time_minutes)
+            
+            cursor = collection.find({
+                "status": {
+                    "$in": [
+                        InterviewStatus.PROCESSING,
+                        InterviewStatus.TRANSCRIBING,
+                        InterviewStatus.ANALYZING
+                    ]
+                },
+                "started_at": {"$lt": cutoff_time}
+            })
+            
+            orphaned = []
+            async for doc in cursor:
+                interview = Interview(**doc)
+                
+                # Verificar se realmente está órfã (não foi atualizada recentemente)
+                if interview.started_at and interview.started_at < cutoff_time:
+                    orphaned.append(interview)
+            
+            return orphaned
+            
+        except Exception as e:
+            logger.error("Failed to find orphaned interviews", extra={
+                "error": str(e)
+            })
+            return []
+    
+    async def _find_retry_candidates(self) -> List[Interview]:
+        """
+        Encontra entrevistas marcadas para retry que já passaram do delay
+        """
+        try:
+            collection = await self.interview_repo._get_collection()
+            
+            # Buscar entrevistas marcadas para retry
+            cutoff_time = datetime.now() - timedelta(minutes=self.retry_delay_minutes)
+            
+            cursor = collection.find({
+                "status": InterviewStatus.FAILED,
+                "retry_count": {"$lt": self.max_retry_attempts},
+                "last_retry_at": {"$lt": cutoff_time}
+            })
+            
+            candidates = []
+            async for doc in cursor:
+                interview = Interview(**doc)
+                candidates.append(interview)
+            
+            return candidates
+            
+        except Exception as e:
+            logger.error("Failed to find retry candidates", extra={
+                "error": str(e)
+            })
+            return []
+    
+    async def _recover_interview(self, interview: Interview):
+        """
+        Recupera uma entrevista órfã
+        """
+        try:
+            logger.info("Recovering orphaned interview", extra={
+                "interview_id": interview.id,
+                "phone_number": interview.phone_number,
+                "stuck_status": interview.status,
+                "processing_time_minutes": (
+                    datetime.now() - interview.started_at
+                ).total_seconds() / 60 if interview.started_at else 0
+            })
+            
+            # Adicionar campos de retry se não existirem
+            if not hasattr(interview, 'retry_count'):
+                interview.retry_count = 0
+            if not hasattr(interview, 'last_retry_at'):
+                interview.last_retry_at = None
+            
+            # Marcar para retry
+            interview.retry_count += 1
+            interview.last_retry_at = datetime.now()
+            interview.status = InterviewStatus.FAILED
+            interview.error = f"Recovered from orphaned state. Retry {interview.retry_count}/{self.max_retry_attempts}"
+            
+            await self.interview_repo.update(interview)
+            
+            # Notificar usuário
+            await self.whatsapp.send_text_message(
+                interview.phone_number,
+                f"🔄 Recuperando processamento interrompido...\n"
+                f"ID: {interview.id[:8]} - Tentativa {interview.retry_count}/{self.max_retry_attempts}"
+            )
+            
+        except Exception as e:
+            logger.error("Failed to recover interview", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+    
+    async def _retry_interview(self, interview: Interview):
+        """
+        Tenta reprocessar uma entrevista
+        """
+        try:
+            if interview.retry_count >= self.max_retry_attempts:
+                await self._mark_permanently_failed(interview)
+                return
+            
+            logger.info("Retrying interview", extra={
+                "interview_id": interview.id,
+                "retry_attempt": interview.retry_count + 1,
+                "max_attempts": self.max_retry_attempts
+            })
+            
+            # Reset para reprocessamento
+            interview.status = InterviewStatus.PENDING
+            interview.error = None
+            interview.retry_count += 1
+            interview.last_retry_at = datetime.now()
+            
+            await self.interview_repo.update(interview)
+            
+            # Recriar message_data para reprocessamento
+            message_data = {
+                "from": interview.phone_number,
+                "type": "audio",
+                "message_id": interview.message_id,
+                "media_id": interview.audio_id
+            }
+            
+            # Reprocessar em background
+            asyncio.create_task(
+                self.message_handler.process_audio_message(message_data)
+            )
+            
+        except Exception as e:
+            logger.error("Failed to retry interview", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+    
+    async def _mark_permanently_failed(self, interview: Interview):
+        """
+        Marca entrevista como permanentemente falhada
+        """
+        try:
+            interview.status = InterviewStatus.FAILED
+            interview.error = f"Permanently failed after {self.max_retry_attempts} attempts"
+            interview.completed_at = datetime.now()
+            
+            await self.interview_repo.update(interview)
+            
+            logger.error("Interview permanently failed", extra={
+                "interview_id": interview.id,
+                "phone_number": interview.phone_number,
+                "retry_attempts": interview.retry_count
+            })
+            
+            # Notificar usuário
+            await self.whatsapp.send_text_message(
+                interview.phone_number,
+                f"❌ Processamento falhou definitivamente\n"
+                f"ID: {interview.id[:8]}\n"
+                f"Tentativas: {interview.retry_count}/{self.max_retry_attempts}\n\n"
+                f"Entre em contato com o suporte se necessário."
+            )
+            
+        except Exception as e:
+            logger.error("Failed to mark interview as permanently failed", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+    
+    async def cleanup_old_interviews(self, days_old: int = 30):
+        """
+        Remove entrevistas muito antigas do banco
+        """
+        try:
+            collection = await self.interview_repo._get_collection()
+            
+            cutoff_date = datetime.now() - timedelta(days=days_old)
+            
+            result = await collection.delete_many({
+                "created_at": {"$lt": cutoff_date},
+                "status": {"$in": [InterviewStatus.COMPLETED, InterviewStatus.FAILED]}
+            })
+            
+            logger.info("Cleaned up old interviews", extra={
+                "deleted_count": result.deleted_count,
+                "days_old": days_old
+            })
+            
+        except Exception as e:
+            logger.error("Failed to cleanup old interviews", extra={
+                "error": str(e)
+            })
+
+# --------------------------------------------------
+# Arquivo: ./app/services/transcription.py
+# --------------------------------------------------
+from typing import Optional, List, Tuple, Callable
+import logging
+from app.infrastructure.ai.whisper import WhisperService
+from app.domain.entities.interview import Interview
+from app.core.exceptions import TranscriptionError
+
+logger = logging.getLogger(__name__)
+
+
+class TranscriptionService:
+    def __init__(self):
+        self.whisper = WhisperService()
+    
+    async def transcribe_chunks(
+        self,
+        chunks: List[Tuple[bytes, float, float]],
+        interview: Interview,
+        progress_callback: Optional[Callable] = None
+    ) -> Optional[str]:
+        """Transcribe audio chunks with progress tracking"""
+        try:
+            full_transcript = ""
+            
+            for i, (chunk_bytes, start_time_minutes, duration_minutes) in enumerate(chunks):
+                logger.info("Transcribing chunk", extra={
+                    "chunk_index": i + 1,
+                    "total_chunks": len(chunks),
+                    "start_time_minutes": start_time_minutes,
+                    "duration_minutes": duration_minutes
+                })
+                
+                # Progress callback
+                if progress_callback:
+                    await progress_callback(interview, i + 1)
+                
+                # Sempre usar transcrição simples (sem locutores fake)
+                chunk_transcript = await self._transcribe_simple(chunk_bytes)
+                
+                if not chunk_transcript:
+                    logger.warning("Chunk transcription failed", extra={
+                        "chunk_index": i + 1
+                    })
+                    continue
+                
+                # Adjust timestamps if not first chunk
+                if start_time_minutes > 0:
+                    chunk_transcript = self._adjust_timestamps(
+                        chunk_transcript, 
+                        start_time_minutes
+                    )
+                
+                # Combine transcripts
+                if full_transcript:
+                    full_transcript += "\n\n" + chunk_transcript
+                else:
+                    full_transcript = chunk_transcript
+            
+            return full_transcript if full_transcript else None
+            
+        except Exception as e:
+            logger.error("Chunk transcription process failed", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+            raise TranscriptionError(f"Failed to transcribe chunks: {str(e)}")
+    
+    async def _transcribe_simple(self, audio_bytes: bytes) -> Optional[str]:
+        """Transcrição com timestamps apenas - sem identificação de locutores"""
+        try:
+            result = await self.whisper.transcribe(audio_bytes)
+            
+            if not result or not result.get("text"):
+                return None
+            
+            # Convert to simple timestamped format
+            transcript_lines = []
+            
+            for segment in result.get("segments", []):
+                start_min = int(segment["start"] // 60)
+                start_sec = int(segment["start"] % 60)
+                end_min = int(segment["end"] // 60)
+                end_sec = int(segment["end"] % 60)
+                
+                timestamp = f"[{start_min:02d}:{start_sec:02d}-{end_min:02d}:{end_sec:02d}]"
+                text = segment["text"].strip()
+                
+                transcript_lines.append(f"{timestamp} {text}")
+            
+            return "\n".join(transcript_lines)
+            
+        except Exception as e:
+            logger.error("Simple transcription failed", extra={
+                "error": str(e)
+            })
+            return None
+    
+    def _adjust_timestamps(self, transcript: str, offset_minutes: float) -> str:
+        """Adjust timestamps by adding offset"""
+        import re
+        
+        def adjust_match(match):
+            start_min = int(match.group(1)) + int(offset_minutes)
+            start_sec = int(match.group(2))
+            
+            if match.group(3) and match.group(4):  # Range format
+                end_min = int(match.group(3)) + int(offset_minutes)
+                end_sec = int(match.group(4))
+                return f"[{start_min:02d}:{start_sec:02d}-{end_min:02d}:{end_sec:02d}]"
+            else:  # Single timestamp
+                return f"[{start_min:02d}:{start_sec:02d}]"
+        
+        pattern = r'\[(\d{1,2}):(\d{2})(?:-(\d{1,2}):(\d{2}))?\]'
+        return re.sub(pattern, adjust_match, transcript)
+# --------------------------------------------------
+# Arquivo: ./backup_20250627_163737/app/api/v1/webhooks.py
+# --------------------------------------------------
+from fastapi import APIRouter, Request, Response, BackgroundTasks
+from typing import Dict, Set
+import logging
+from app.services.message_handler import MessageHandler
+from app.domain.value_objects.phone_number import BrazilianPhoneNumber
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+# Simple in-memory cache for duplicate detection
+processed_messages: Set[str] = set()
+
+
+@router.get("")
+async def verify_webhook(request: Request):
+    """Verify webhook with WhatsApp"""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode == "subscribe" and token == settings.WHATSAPP_VERIFY_TOKEN:
+        logger.info("Webhook verified successfully")
+        return Response(content=challenge, status_code=200)
+    else:
+        logger.warning("Webhook verification failed")
+        return Response(status_code=403)
+
+
+@router.post("")
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Main webhook endpoint - immediate response with background processing"""
+    try:
+        data = await request.json()
+        
+        # Quick validation
+        if not _is_valid_message(data):
+            return Response(status_code=200)
+        
+        # Extract message data
+        message_data = _extract_message_data(data)
+        if not message_data:
+            return Response(status_code=200)
+        
+        # Handle different message types
+        if message_data["type"] == "audio":
+            # Schedule background processing
+            handler = MessageHandler()
+            background_tasks.add_task(handler.process_audio_message, message_data)
+            
+            logger.info("Audio processing scheduled", extra={
+                "message_id": message_data["message_id"],
+                "from": message_data["from"]
+            })
+        
+        elif message_data["type"] == "text":
+            # Handle text commands immediately
+            await _handle_text_message(message_data)
+        
+        return Response(status_code=200)
+        
+    except Exception as e:
+        logger.error("Webhook processing error", extra={
+            "error": str(e)
+        })
+        return Response(status_code=500)
+
+
+def _is_valid_message(data: dict) -> bool:
+    """Check if webhook contains valid message"""
+    try:
+        entry = data.get("entry", [])
+        if not entry:
+            return False
+            
+        changes = entry[0].get("changes", [])
+        if not changes:
+            return False
+            
+        value = changes[0].get("value", {})
+        
+        # Ignore status updates
+        if "statuses" in value:
+            return False
+        
+        # Check for messages
+        messages = value.get("messages", [])
+        return bool(messages)
+        
+    except (IndexError, KeyError):
+        return False
+
+
+def _extract_message_data(data: dict) -> Dict:
+    """Extract message data with duplicate protection"""
+    try:
+        messages = data["entry"][0]["changes"][0]["value"]["messages"][0]
+        
+        message_id = messages["id"]
+        message_type = messages["type"]
+        from_number = messages["from"]
+        
+        # Check for duplicates
+        if message_id in processed_messages:
+            logger.info("Duplicate message ignored", extra={
+                "message_id": message_id
+            })
+            return None
+        
+        # Add to cache
+        processed_messages.add(message_id)
+        
+        # Clean cache if too large
+        if len(processed_messages) > settings.MAX_CACHE_SIZE:
+            processed_messages.clear()
+        
+        # Validate and fix phone number
+        try:
+            phone = BrazilianPhoneNumber(number=from_number)
+            from_number = phone.number
+        except:
+            pass  # Use original number if validation fails
+        
+        result = {
+            "from": from_number,
+            "type": message_type,
+            "message_id": message_id,
+            "timestamp": messages.get("timestamp")
+        }
+        
+        if message_type == "audio":
+            result["media_id"] = messages["audio"]["id"]
+        elif message_type == "text":
+            result["content"] = messages["text"]["body"]
+        
+        return result
+        
+    except (KeyError, IndexError) as e:
+        logger.error("Error extracting message data", extra={
+            "error": str(e)
+        })
+        return None
+
+
+async def _handle_text_message(message_data: Dict):
+    """Handle text commands immediately"""
+    from app.infrastructure.whatsapp.client import WhatsAppClient
+    
+    whatsapp = WhatsAppClient()
+    from_number = message_data["from"]
+    text = message_data["content"].lower().strip()
+    
+    if text in ["help", "ajuda", "/help"]:
+        help_message = """
+📋 *Bot de Relatório de Entrevistas* - Sistema Enterprise
+
+🎵 **Processamento em Background:**
+• Resposta imediata ao WhatsApp (<1s)
+• Processamento paralelo de áudios longos
+• Chunks otimizados de 15min
+• Progress updates em tempo real
+• Arquitetura limpa e escalável
+
+📄 **Você receberá 2 documentos:**
+1️⃣ **TRANSCRIÇÃO** - Texto completo com timestamps precisos
+2️⃣ **ANÁLISE** - Relatório estruturado profissional
+
+🎙️ **Transcrição:**
+• Timestamps precisos [MM:SS-MM:SS]
+• Texto completo sem identificação de locutores
+• Análise inteligente do contexto da conversa
+
+🚀 **Como usar:**
+Apenas envie o áudio da entrevista (QUALQUER duração)!
+
+💡 **Comandos úteis:**
+• `help` - Esta mensagem
+• `status` - Informações do sistema
+        """
+        await whatsapp.send_text_message(from_number, help_message)
+    
+    elif text == "status":
+        status_message = f"""
+📊 *System Status*
+
+⚡ **Mode:** Background processing enabled
+🚀 **Architecture:** Clean & Scalable
+💾 **Cache:** {len(processed_messages)} messages processed
+🛡️ **Protection:** Anti-duplicate enabled
+🎙️ **Transcription:** Whisper + Timestamps
+🧠 **Analysis:** Gemini AI
+🗄️ **Database:** MongoDB Atlas
+
+🎵 **Transcrição:** Apenas timestamps (sem locutores)
+        """
+        await whatsapp.send_text_message(from_number, status_message)
+    
+    else:
+        await whatsapp.send_text_message(
+            from_number, 
+            "👋 Envie-me uma gravação de áudio de entrevista!\n⚡ Resposta imediata + processamento enterprise em background!\n🎙️ Transcrição com timestamps precisos"
+        )
+# --------------------------------------------------
+# Arquivo: ./backup_20250627_163737/app/core/config.py
+# --------------------------------------------------
+from functools import lru_cache
+from typing import Optional
+
+# Imports corretos para Pydantic V2
+from pydantic import ConfigDict
+from pydantic_settings import BaseSettings
+
+
+class Settings(BaseSettings):
+    # Estrutura correta, usando model_config e sem a 'class Config'
+    model_config = ConfigDict(env_file=".env", case_sensitive=True)
+
+    # App
+    APP_NAME: str = "Interview Bot"
+    VERSION: str = "2.0.0"
+    DEBUG: bool = False
+    ENVIRONMENT: str = "development"
+    
+    # WhatsApp
+    WHATSAPP_TOKEN: str
+    WHATSAPP_VERIFY_TOKEN: str
+    PHONE_NUMBER_ID: str
+    WHATSAPP_API_VERSION: str = "v18.0"
+    
+    # AI Services
+    OPENAI_API_KEY: str
+    GEMINI_API_KEY: str
+    WHISPER_MODEL: str = "whisper-1"
+    
+    # Database
+    MONGODB_URL: str
+    DB_NAME: str = "interview_bot"
+    
+    # Processing
+    AUDIO_CHUNK_MINUTES: int = 15
+    MAX_RETRIES: int = 3
+    MAX_CACHE_SIZE: int = 1000
+    
+    # Rate Limiting
+    RATE_LIMIT_PER_MINUTE: int = 10
+    RATE_LIMIT_PER_HOUR: int = 100
+
+
+@lru_cache()
+def get_settings():
+    return Settings()
+
+
+settings = get_settings()
+# --------------------------------------------------
+# Arquivo: ./backup_20250627_163737/app/domain/entities/interview.py
+# --------------------------------------------------
+from datetime import datetime
+from typing import Optional, List
+from pydantic import BaseModel, Field
+from enum import Enum
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class InterviewStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    TRANSCRIBING = "transcribing"
+    ANALYZING = "analyzing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class Interview(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+    id: str = Field(default_factory=lambda: str(int(datetime.now().timestamp() * 1000)))
+    phone_number: str
+    message_id: str
+    status: InterviewStatus = InterviewStatus.PENDING
+    
+    # Audio info
+    audio_id: str
+    audio_size_mb: float = 0.0
+    duration_minutes: Optional[float] = None
+    
+    # Processing info
+    chunks_total: int = 0
+    chunks_processed: int = 0
+    
+    # Results
+    transcript: Optional[str] = None
+    analysis: Optional[str] = None
+    
+    # Files
+    transcript_file_id: Optional[str] = None
+    analysis_file_id: Optional[str] = None
+    
+    # Metadata
+    created_at: datetime = Field(default_factory=datetime.now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error: Optional[str] = None
+        
+    def mark_processing(self):
+        self.status = InterviewStatus.PROCESSING
+        self.started_at = datetime.now()
+    
+    def mark_completed(self):
+        self.status = InterviewStatus.COMPLETED
+        self.completed_at = datetime.now()
+    
+    def mark_failed(self, error: str):
+        self.status = InterviewStatus.FAILED
+        self.error = error
+        self.completed_at = datetime.now()
+# --------------------------------------------------
+# Arquivo: ./backup_20250627_163737/app/main.py
+# --------------------------------------------------
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+import logging
+
+from app.api.v1 import webhooks, health
+from app.api.middleware.error_handler import ErrorHandlerMiddleware
+from app.core.config import settings
+from app.core.logging import setup_logging
+from app.infrastructure.database.mongodb import MongoDB
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    setup_logging(debug=settings.DEBUG)
+    logger.info("Starting Interview Bot", extra={
+        "version": settings.VERSION,
+        "environment": settings.ENVIRONMENT
+    })
+    
+    await MongoDB.connect()
+    
+    yield
+    
+    # Shutdown
+    await MongoDB.disconnect()
+    logger.info("Interview Bot shutdown complete")
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.VERSION,
+    description="WhatsApp Interview Bot with Clean Architecture",
+    lifespan=lifespan
+)
+
+# Middleware
+app.add_middleware(ErrorHandlerMiddleware)
+
+# Routes
+app.include_router(health.router, prefix="/health", tags=["health"])
+app.include_router(webhooks.router, prefix="/webhook", tags=["whatsapp"])
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": f"{settings.APP_NAME} is running!",
+        "version": settings.VERSION,
+        "status": "healthy",
+        "features": [
+            "Clean Architecture",
+            "Background Processing",
+            "MongoDB Atlas",
+            "Whisper + Gemini",
+            "Production Ready"
+        ]
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=settings.DEBUG
+    )
+
+# --------------------------------------------------
+# Arquivo: ./backup_20250627_163737/app/prompts/interview_analysis.py
+# --------------------------------------------------
+INTERVIEW_ANALYSIS_PROMPT = """
+Com base APENAS na transcrição da entrevista fornecida (que contém timestamps e diálogos), gere um relatório abrangente que responda às seguintes questões.
+Estruture a saída com títulos claros para cada questão. Seja detalhado, mas conciso. Responda em PORTUGUÊS.
+
+IMPORTANTE: A transcrição contém apenas timestamps [MM:SS-MM:SS] seguidos do texto falado. Analise o conteúdo para identificar as diferentes vozes e o contexto da entrevista.
+
+1. **Experiência Profissional e Conquistas:**
+   - Resuma a trajetória profissional mencionada na entrevista, incluindo cargos principais, empresas e progressão na carreira
+   - Destaque as conquistas, projetos ou realizações mais significativas relatadas
+   - Anote quaisquer certificações, educação ou habilidades técnicas relevantes discutidas
+   - Inclua exemplos específicos fornecidos durante a conversa
+
+2. **Histórico Pessoal:**
+   - Descreva o histórico pessoal relevante, motivações ou experiências de vida compartilhadas
+   - Inclua interesses pessoais, valores ou circunstâncias que possam ser relevantes para o perfil profissional
+   - Anote quaisquer desafios superados ou perspectivas únicas mencionadas
+
+3. **Avaliação de Personalidade e Habilidades:**
+   - Com base na linguagem, tom e exemplos fornecidos, identifique os principais traços de personalidade
+   - Avalie habilidades interpessoais como estilo de comunicação, abordagem de resolução de problemas, capacidades de trabalho em equipe
+   - Anote qualidades de liderança, adaptabilidade e outros indicadores comportamentais observados
+   - Inclua exemplos específicos da transcrição que apoiem essas avaliações
+   - Observe a qualidade das respostas e a estrutura do pensamento demonstrada
+
+4. **Pontos Fortes e Áreas de Desenvolvimento:**
+   - Liste os principais pontos fortes identificados com base na entrevista
+   - Identifique possíveis áreas de desenvolvimento ou lacunas mencionadas
+   - Forneça recomendações específicas baseadas no perfil apresentado
+
+5. **Adequação Cultural e Motivacional:**
+   - Avalie a motivação para a posição/empresa discutida
+   - Identifique valores e características que podem indicar boa adequação cultural
+   - Analise expectativas de carreira e alinhamento com objetivos organizacionais
+
+6. **Impressões Gerais:**
+   - Forneça uma avaliação geral do candidato baseada na entrevista
+   - Destaque aspectos únicos ou diferenciadores observados
+   - Inclua recomendações finais sobre o perfil apresentado
+
+Certifique-se de que todas as informações vêm diretamente da transcrição e evite fazer suposições além do que foi explicitamente discutido.
+Analise o contexto e o fluxo da conversa para distinguir entre perguntas e respostas, mesmo sem identificação explícita de locutores.
+"""
+# --------------------------------------------------
+# Arquivo: ./backup_20250627_163737/app/services/message_handler.py
+# --------------------------------------------------
+from typing import Dict
+import logging
+import os
+from app.domain.entities.interview import Interview, InterviewStatus
+from app.infrastructure.database.repositories.interview import InterviewRepository
 from app.infrastructure.whatsapp.client import WhatsAppClient
 from app.services.audio_processor import AudioProcessor
 from app.services.transcription import TranscriptionService
@@ -1946,8 +4034,7 @@ class MessageHandler:
             interview = Interview(
                 phone_number=message_data["from"],
                 message_id=message_data["message_id"],
-                audio_id=message_data["media_id"],
-                simple_mode=message_data.get("simple_mode", False)
+                audio_id=message_data["media_id"]
             )
             
             await self.interview_repo.create(interview)
@@ -1989,10 +4076,9 @@ class MessageHandler:
         interview.audio_size_mb = len(audio_bytes) / (1024 * 1024)
         
         # Step 2: Convert and split
-        mode_text = "SIMPLES" if interview.simple_mode else "COMPLETO"
         await self.whatsapp.send_text_message(
             interview.phone_number,
-            f"🔄 Convertendo e dividindo áudio ({interview.audio_size_mb:.1f}MB)\n📝 Modo: {mode_text}"
+            f"🔄 Convertendo e dividindo áudio ({interview.audio_size_mb:.1f}MB)\n📝 Transcrição com timestamps"
         )
         
         mp3_bytes = self.audio_processor.convert_to_mp3(audio_bytes)
@@ -2038,7 +4124,7 @@ class MessageHandler:
         await self.whatsapp.send_text_message(
             interview.phone_number,
             f"🎉 Processamento completo! (ID: {interview.id[:8]})\n\n"
-            f"📝 Modo: {mode_text}\n"
+            f"📝 Transcrição: Com timestamps precisos\n"
             f"📄 {2 if analysis else 1} documento(s) enviado(s)\n"
             f"⏱️ Processamento em background concluído!"
         )
@@ -2048,10 +4134,9 @@ class MessageHandler:
         interview.chunks_processed = chunk_num
         await self.interview_repo.update(interview)
         
-        mode_text = "SIMPLES" if interview.simple_mode else "COMPLETO"
         await self.whatsapp.send_text_message(
             interview.phone_number,
-            f"🎙️ Transcrevendo chunk {chunk_num}/{interview.chunks_total} - Modo {mode_text}"
+            f"🎙️ Transcrevendo chunk {chunk_num}/{interview.chunks_total}"
         )
     
     async def _create_and_send_documents(self, interview: Interview):
@@ -2098,9 +4183,8 @@ class MessageHandler:
                         os.remove(path)
                 except:
                     pass
-
 # --------------------------------------------------
-# Arquivo: ./app/services/transcription.py
+# Arquivo: ./backup_20250627_163737/app/services/transcription.py
 # --------------------------------------------------
 from typing import Optional, List, Tuple, Callable
 import logging
@@ -2137,11 +4221,8 @@ class TranscriptionService:
                 if progress_callback:
                     await progress_callback(interview, i + 1)
                 
-                # Transcribe chunk
-                if interview.simple_mode:
-                    chunk_transcript = await self._transcribe_simple(chunk_bytes)
-                else:
-                    chunk_transcript = await self._transcribe_with_speakers(chunk_bytes)
+                # Sempre usar transcrição simples (sem locutores fake)
+                chunk_transcript = await self._transcribe_simple(chunk_bytes)
                 
                 if not chunk_transcript:
                     logger.warning("Chunk transcription failed", extra={
@@ -2171,46 +4252,8 @@ class TranscriptionService:
             })
             raise TranscriptionError(f"Failed to transcribe chunks: {str(e)}")
     
-    async def _transcribe_with_speakers(self, audio_bytes: bytes) -> Optional[str]:
-        """Transcribe with speaker identification using Whisper + post-processing"""
-        try:
-            result = await self.whisper.transcribe(audio_bytes)
-            
-            if not result or not result.get("text"):
-                return None
-            
-            # Convert Whisper segments to speaker-identified transcript
-            # This is a simplified approach - in production you might want
-            # to use additional speaker diarization models
-            transcript_lines = []
-            current_speaker = "LOCUTOR 1"
-            
-            for segment in result.get("segments", []):
-                start_min = int(segment["start"] // 60)
-                start_sec = int(segment["start"] % 60)
-                end_min = int(segment["end"] // 60)
-                end_sec = int(segment["end"] % 60)
-                
-                timestamp = f"[{start_min:02d}:{start_sec:02d}-{end_min:02d}:{end_sec:02d}]"
-                text = segment["text"].strip()
-                
-                # Simple speaker alternation logic
-                # In production, use proper speaker diarization
-                if len(transcript_lines) > 0 and len(text) > 50:
-                    current_speaker = "LOCUTOR 2" if current_speaker == "LOCUTOR 1" else "LOCUTOR 1"
-                
-                transcript_lines.append(f"{current_speaker}: {timestamp} {text}")
-            
-            return "\n".join(transcript_lines)
-            
-        except Exception as e:
-            logger.error("Speaker transcription failed", extra={
-                "error": str(e)
-            })
-            return None
-    
     async def _transcribe_simple(self, audio_bytes: bytes) -> Optional[str]:
-        """Simple transcription without speaker identification"""
+        """Transcrição com timestamps apenas - sem identificação de locutores"""
         try:
             result = await self.whisper.transcribe(audio_bytes)
             
@@ -2256,7 +4299,6 @@ class TranscriptionService:
         
         pattern = r'\[(\d{1,2}):(\d{2})(?:-(\d{1,2}):(\d{2}))?\]'
         return re.sub(pattern, adjust_match, transcript)
-
 # --------------------------------------------------
 # Arquivo: ./docker-compose.yml
 # --------------------------------------------------
@@ -2342,24 +4384,40 @@ CMD ["gunicorn", "app.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker
 # Arquivo: ./fly.toml
 # --------------------------------------------------
 # fly.toml app configuration file
-app = "whatsappbots"
+app = "interview-bot-prod"
 primary_region = "gru"
 
 [build]
 
+[env]
+  DEBUG = "false"
+  ENVIRONMENT = "production"
+  HOST = "0.0.0.0"
+  PORT = "8000"
+
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = "off"  # CRITICAL: Don't auto-stop during long processing!
+  auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 1    # Keep at least 1 machine running
+  min_machines_running = 1
   processes = ["app"]
 
-# Configure machine resources - increased for long audio processing
+  # Configurações de timeout para áudios longos
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
+
 [[vm]]
-  memory = "2gb"  # 2GB RAM for 1+ hour audio files
+  memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
+
+# Configuração para manter dados temporários
+[[mounts]]
+  source = "data"
+  destination = "/app/logs"
 # --------------------------------------------------
 # Arquivo: ./gerar.sh
 # --------------------------------------------------
@@ -2461,6 +4519,793 @@ echo "O contexto do projeto foi salvo em: $OUTPUT_FILE"
 echo ""
 echo "⚠️ IMPORTANTE: Revise o arquivo '$OUTPUT_FILE' antes de compartilhá-lo para garantir que nenhuma informação sensível (como senhas ou chaves de API) foi incluída."
 # --------------------------------------------------
+# Arquivo: ./recovery.sh
+# --------------------------------------------------
+#!/bin/bash
+
+# =============================================================================
+# DEPLOY RECOVERY SYSTEM - Interview Bot
+# =============================================================================
+
+set -e
+
+echo "🚀 Implementando Sistema de Recovery..."
+echo "======================================"
+
+# Cores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+PROJECT_ROOT=$(pwd)
+
+# Função para criar backup
+create_backup() {
+    echo -e "${YELLOW}📦 Criando backup dos arquivos existentes...${NC}"
+    BACKUP_DIR="backup_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    
+    # Backup dos arquivos que vamos modificar
+    FILES_TO_BACKUP=(
+        "app/domain/entities/interview.py"
+        "app/services/transcription.py"
+        "app/services/message_handler.py"
+        "app/api/v1/webhooks.py"
+        "app/main.py"
+        "app/prompts/interview_analysis.py"
+        "app/core/config.py"
+    )
+    
+    for file in "${FILES_TO_BACKUP[@]}"; do
+        if [ -f "$file" ]; then
+            mkdir -p "$BACKUP_DIR/$(dirname "$file")"
+            cp "$file" "$BACKUP_DIR/$file"
+            echo "  ✅ Backup: $file"
+        fi
+    done
+    
+    echo -e "${GREEN}✅ Backup criado em: $BACKUP_DIR${NC}"
+}
+
+# Função para criar diretórios
+create_directories() {
+    echo -e "${YELLOW}📁 Criando diretórios necessários...${NC}"
+    mkdir -p app/services
+    mkdir -p app/api/v1
+    mkdir -p scripts
+    mkdir -p logs
+    echo -e "${GREEN}✅ Diretórios criados${NC}"
+}
+
+# Função para criar RecoveryService
+create_recovery_service() {
+    echo -e "${YELLOW}📝 Criando RecoveryService...${NC}"
+    
+    cat > app/services/recovery_service.py << 'RECOVERY_SERVICE_EOF'
+from datetime import datetime, timedelta
+from typing import List, Optional
+import logging
+import asyncio
+from app.domain.entities.interview import Interview, InterviewStatus
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.services.message_handler import MessageHandler
+from app.infrastructure.whatsapp.client import WhatsAppClient
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class RecoveryService:
+    """
+    Serviço para recuperar entrevistas órfãs e com falhas
+    """
+    
+    def __init__(self):
+        self.interview_repo = InterviewRepository()
+        self.whatsapp = WhatsAppClient()
+        self.message_handler = MessageHandler()
+        
+        # Configurações de recovery
+        self.max_processing_time_minutes = 60  # Considera órfã após 1 hora
+        self.max_retry_attempts = 3
+        self.retry_delay_minutes = 5
+    
+    async def run_recovery_cycle(self):
+        """
+        Executa um ciclo completo de recuperação
+        """
+        logger.info("Starting recovery cycle")
+        
+        try:
+            # Buscar entrevistas órfãs
+            orphaned_interviews = await self._find_orphaned_interviews()
+            
+            if orphaned_interviews:
+                logger.info("Found orphaned interviews", extra={
+                    "count": len(orphaned_interviews)
+                })
+                
+                for interview in orphaned_interviews:
+                    await self._recover_interview(interview)
+            
+            # Buscar entrevistas para retry
+            retry_interviews = await self._find_retry_candidates()
+            
+            if retry_interviews:
+                logger.info("Found interviews ready for retry", extra={
+                    "count": len(retry_interviews)
+                })
+                
+                for interview in retry_interviews:
+                    await self._retry_interview(interview)
+            
+            logger.info("Recovery cycle completed")
+            
+        except Exception as e:
+            logger.error("Recovery cycle failed", extra={
+                "error": str(e)
+            })
+    
+    async def _find_orphaned_interviews(self) -> List[Interview]:
+        """
+        Encontra entrevistas órfãs (processando há muito tempo)
+        """
+        try:
+            collection = await self.interview_repo._get_collection()
+            
+            # Buscar entrevistas em processamento há mais de X minutos
+            cutoff_time = datetime.now() - timedelta(minutes=self.max_processing_time_minutes)
+            
+            cursor = collection.find({
+                "status": {
+                    "$in": [
+                        InterviewStatus.PROCESSING,
+                        InterviewStatus.TRANSCRIBING,
+                        InterviewStatus.ANALYZING
+                    ]
+                },
+                "started_at": {"$lt": cutoff_time}
+            })
+            
+            orphaned = []
+            async for doc in cursor:
+                interview = Interview(**doc)
+                
+                # Verificar se realmente está órfã (não foi atualizada recentemente)
+                if interview.started_at and interview.started_at < cutoff_time:
+                    orphaned.append(interview)
+            
+            return orphaned
+            
+        except Exception as e:
+            logger.error("Failed to find orphaned interviews", extra={
+                "error": str(e)
+            })
+            return []
+    
+    async def _find_retry_candidates(self) -> List[Interview]:
+        """
+        Encontra entrevistas marcadas para retry que já passaram do delay
+        """
+        try:
+            collection = await self.interview_repo._get_collection()
+            
+            # Buscar entrevistas marcadas para retry
+            cutoff_time = datetime.now() - timedelta(minutes=self.retry_delay_minutes)
+            
+            cursor = collection.find({
+                "status": InterviewStatus.FAILED,
+                "retry_count": {"$lt": self.max_retry_attempts},
+                "last_retry_at": {"$lt": cutoff_time}
+            })
+            
+            candidates = []
+            async for doc in cursor:
+                interview = Interview(**doc)
+                candidates.append(interview)
+            
+            return candidates
+            
+        except Exception as e:
+            logger.error("Failed to find retry candidates", extra={
+                "error": str(e)
+            })
+            return []
+    
+    async def _recover_interview(self, interview: Interview):
+        """
+        Recupera uma entrevista órfã
+        """
+        try:
+            logger.info("Recovering orphaned interview", extra={
+                "interview_id": interview.id,
+                "phone_number": interview.phone_number,
+                "stuck_status": interview.status,
+                "processing_time_minutes": (
+                    datetime.now() - interview.started_at
+                ).total_seconds() / 60 if interview.started_at else 0
+            })
+            
+            # Adicionar campos de retry se não existirem
+            if not hasattr(interview, 'retry_count'):
+                interview.retry_count = 0
+            if not hasattr(interview, 'last_retry_at'):
+                interview.last_retry_at = None
+            
+            # Marcar para retry
+            interview.retry_count += 1
+            interview.last_retry_at = datetime.now()
+            interview.status = InterviewStatus.FAILED
+            interview.error = f"Recovered from orphaned state. Retry {interview.retry_count}/{self.max_retry_attempts}"
+            
+            await self.interview_repo.update(interview)
+            
+            # Notificar usuário
+            await self.whatsapp.send_text_message(
+                interview.phone_number,
+                f"🔄 Recuperando processamento interrompido...\n"
+                f"ID: {interview.id[:8]} - Tentativa {interview.retry_count}/{self.max_retry_attempts}"
+            )
+            
+        except Exception as e:
+            logger.error("Failed to recover interview", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+    
+    async def _retry_interview(self, interview: Interview):
+        """
+        Tenta reprocessar uma entrevista
+        """
+        try:
+            if interview.retry_count >= self.max_retry_attempts:
+                await self._mark_permanently_failed(interview)
+                return
+            
+            logger.info("Retrying interview", extra={
+                "interview_id": interview.id,
+                "retry_attempt": interview.retry_count + 1,
+                "max_attempts": self.max_retry_attempts
+            })
+            
+            # Reset para reprocessamento
+            interview.status = InterviewStatus.PENDING
+            interview.error = None
+            interview.retry_count += 1
+            interview.last_retry_at = datetime.now()
+            
+            await self.interview_repo.update(interview)
+            
+            # Recriar message_data para reprocessamento
+            message_data = {
+                "from": interview.phone_number,
+                "type": "audio",
+                "message_id": interview.message_id,
+                "media_id": interview.audio_id
+            }
+            
+            # Reprocessar em background
+            asyncio.create_task(
+                self.message_handler.process_audio_message(message_data)
+            )
+            
+        except Exception as e:
+            logger.error("Failed to retry interview", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+    
+    async def _mark_permanently_failed(self, interview: Interview):
+        """
+        Marca entrevista como permanentemente falhada
+        """
+        try:
+            interview.status = InterviewStatus.FAILED
+            interview.error = f"Permanently failed after {self.max_retry_attempts} attempts"
+            interview.completed_at = datetime.now()
+            
+            await self.interview_repo.update(interview)
+            
+            logger.error("Interview permanently failed", extra={
+                "interview_id": interview.id,
+                "phone_number": interview.phone_number,
+                "retry_attempts": interview.retry_count
+            })
+            
+            # Notificar usuário
+            await self.whatsapp.send_text_message(
+                interview.phone_number,
+                f"❌ Processamento falhou definitivamente\n"
+                f"ID: {interview.id[:8]}\n"
+                f"Tentativas: {interview.retry_count}/{self.max_retry_attempts}\n\n"
+                f"Entre em contato com o suporte se necessário."
+            )
+            
+        except Exception as e:
+            logger.error("Failed to mark interview as permanently failed", extra={
+                "error": str(e),
+                "interview_id": interview.id
+            })
+    
+    async def cleanup_old_interviews(self, days_old: int = 30):
+        """
+        Remove entrevistas muito antigas do banco
+        """
+        try:
+            collection = await self.interview_repo._get_collection()
+            
+            cutoff_date = datetime.now() - timedelta(days=days_old)
+            
+            result = await collection.delete_many({
+                "created_at": {"$lt": cutoff_date},
+                "status": {"$in": [InterviewStatus.COMPLETED, InterviewStatus.FAILED]}
+            })
+            
+            logger.info("Cleaned up old interviews", extra={
+                "deleted_count": result.deleted_count,
+                "days_old": days_old
+            })
+            
+        except Exception as e:
+            logger.error("Failed to cleanup old interviews", extra={
+                "error": str(e)
+            })
+RECOVERY_SERVICE_EOF
+
+    echo "  ✅ RecoveryService criado"
+}
+
+# Função para criar Recovery API
+create_recovery_api() {
+    echo -e "${YELLOW}📝 Criando Recovery API...${NC}"
+    
+    cat > app/api/v1/recovery.py << 'RECOVERY_API_EOF'
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from typing import Dict, List
+import logging
+from datetime import datetime, timedelta
+from app.services.recovery_service import RecoveryService
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.domain.entities.interview import InterviewStatus
+
+logger = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.post("/recovery/run")
+async def run_recovery(background_tasks: BackgroundTasks):
+    """Executa ciclo de recovery em background"""
+    try:
+        recovery_service = RecoveryService()
+        background_tasks.add_task(recovery_service.run_recovery_cycle)
+        
+        return {
+            "message": "Recovery cycle started in background",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error("Failed to start recovery cycle", extra={
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/recovery/status")
+async def get_recovery_status():
+    """Retorna status das entrevistas para monitoramento"""
+    try:
+        interview_repo = InterviewRepository()
+        collection = await interview_repo._get_collection()
+        
+        # Contar por status
+        pipeline = [
+            {"$group": {
+                "_id": "$status",
+                "count": {"$sum": 1}
+            }}
+        ]
+        
+        status_counts = {}
+        async for doc in collection.aggregate(pipeline):
+            status_counts[doc["_id"]] = doc["count"]
+        
+        # Buscar entrevistas órfãs
+        cutoff_time = datetime.now() - timedelta(minutes=60)
+        orphaned_count = await collection.count_documents({
+            "status": {
+                "$in": [
+                    InterviewStatus.PROCESSING,
+                    InterviewStatus.TRANSCRIBING,
+                    InterviewStatus.ANALYZING
+                ]
+            },
+            "started_at": {"$lt": cutoff_time}
+        })
+        
+        # Buscar entrevistas para retry
+        retry_cutoff = datetime.now() - timedelta(minutes=5)
+        retry_ready_count = await collection.count_documents({
+            "status": InterviewStatus.FAILED,
+            "retry_count": {"$lt": 3},
+            "last_retry_at": {"$lt": retry_cutoff}
+        })
+        
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "status_counts": status_counts,
+            "orphaned_interviews": orphaned_count,
+            "retry_ready": retry_ready_count,
+            "total_interviews": sum(status_counts.values()) if status_counts else 0
+        }
+        
+    except Exception as e:
+        logger.error("Failed to get recovery status", extra={
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/recovery/orphaned")
+async def list_orphaned_interviews():
+    """Lista entrevistas órfãs para debugging"""
+    try:
+        recovery_service = RecoveryService()
+        orphaned = await recovery_service._find_orphaned_interviews()
+        
+        return {
+            "count": len(orphaned),
+            "interviews": [
+                {
+                    "id": interview.id,
+                    "phone_number": interview.phone_number,
+                    "status": interview.status,
+                    "started_at": interview.started_at.isoformat() if interview.started_at else None,
+                    "chunks_processed": interview.chunks_processed,
+                    "chunks_total": interview.chunks_total,
+                    "processing_time_minutes": (
+                        datetime.now() - interview.started_at
+                    ).total_seconds() / 60 if interview.started_at else 0
+                }
+                for interview in orphaned
+            ]
+        }
+        
+    except Exception as e:
+        logger.error("Failed to list orphaned interviews", extra={
+            "error": str(e)
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/recovery/interview/{interview_id}")
+async def force_retry_interview(interview_id: str, background_tasks: BackgroundTasks):
+    """Força retry de uma entrevista específica"""
+    try:
+        interview_repo = InterviewRepository()
+        interview = await interview_repo.get_by_id(interview_id)
+        
+        if not interview:
+            raise HTTPException(status_code=404, detail="Interview not found")
+        
+        recovery_service = RecoveryService()
+        background_tasks.add_task(recovery_service._retry_interview, interview)
+        
+        return {
+            "message": f"Retry scheduled for interview {interview_id}",
+            "interview_id": interview_id,
+            "current_status": interview.status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to force retry interview", extra={
+            "error": str(e),
+            "interview_id": interview_id
+        })
+        raise HTTPException(status_code=500, detail=str(e))
+RECOVERY_API_EOF
+
+    echo "  ✅ Recovery API criado"
+}
+
+# Função para criar script de recovery
+create_recovery_script() {
+    echo -e "${YELLOW}📝 Criando script de recovery...${NC}"
+    
+    cat > scripts/recovery.py << 'RECOVERY_SCRIPT_EOF'
+#!/usr/bin/env python3
+"""
+Recovery Script - Recupera entrevistas órfãs e com falhas
+
+Usage:
+  python scripts/recovery.py              # Executa recovery completo
+  python scripts/recovery.py --status     # Apenas mostra status
+  python scripts/recovery.py --cleanup 30 # Remove entrevistas antigas (30+ dias)
+"""
+
+import asyncio
+import sys
+import os
+import argparse
+
+# Adicionar o diretório do projeto ao path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.services.recovery_service import RecoveryService
+from app.infrastructure.database.mongodb import MongoDB
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.core.logging import setup_logging
+from app.core.config import settings
+import logging
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+
+async def show_status():
+    """Mostra status das entrevistas"""
+    try:
+        interview_repo = InterviewRepository()
+        collection = await interview_repo._get_collection()
+        
+        print("\n📊 STATUS DAS ENTREVISTAS")
+        print("=" * 50)
+        
+        # Contar por status
+        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+        
+        status_counts = {}
+        async for doc in collection.aggregate(pipeline):
+            status_counts[doc["_id"]] = doc["count"]
+        
+        for status, count in status_counts.items():
+            print(f"{status.upper()}: {count}")
+        
+        # Entrevistas órfãs
+        cutoff_time = datetime.now() - timedelta(minutes=60)
+        orphaned_count = await collection.count_documents({
+            "status": {"$in": ["processing", "transcribing", "analyzing"]},
+            "started_at": {"$lt": cutoff_time}
+        })
+        
+        print(f"\n🚨 ÓRFÃS (>1h processando): {orphaned_count}")
+        
+        # Entrevistas para retry
+        retry_cutoff = datetime.now() - timedelta(minutes=5)
+        retry_count = await collection.count_documents({
+            "status": "failed",
+            "retry_count": {"$lt": 3},
+            "last_retry_at": {"$lt": retry_cutoff}
+        })
+        
+        print(f"🔄 PRONTAS PARA RETRY: {retry_count}")
+        print(f"📈 TOTAL: {sum(status_counts.values())}")
+        
+    except Exception as e:
+        logger.error("Failed to show status", extra={"error": str(e)})
+        print(f"❌ Erro ao buscar status: {e}")
+
+
+async def run_recovery():
+    """Executa recovery completo"""
+    try:
+        print("\n🔄 INICIANDO RECOVERY...")
+        
+        recovery_service = RecoveryService()
+        await recovery_service.run_recovery_cycle()
+        
+        print("✅ Recovery concluído com sucesso!")
+        
+    except Exception as e:
+        logger.error("Recovery failed", extra={"error": str(e)})
+        print(f"❌ Recovery falhou: {e}")
+
+
+async def cleanup_old(days: int):
+    """Remove entrevistas antigas"""
+    try:
+        if days < 7:
+            print("❌ Mínimo de 7 dias para cleanup")
+            return
+        
+        print(f"\n🗑️ LIMPANDO ENTREVISTAS COM {days}+ DIAS...")
+        
+        recovery_service = RecoveryService()
+        await recovery_service.cleanup_old_interviews(days)
+        
+        print("✅ Cleanup concluído!")
+        
+    except Exception as e:
+        logger.error("Cleanup failed", extra={"error": str(e)})
+        print(f"❌ Cleanup falhou: {e}")
+
+
+async def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(description="Recovery System for Interview Bot")
+    parser.add_argument("--status", action="store_true", help="Show status only")
+    parser.add_argument("--cleanup", type=int, metavar="DAYS", help="Cleanup interviews older than N days")
+    
+    args = parser.parse_args()
+    
+    try:
+        # Setup
+        setup_logging(debug=settings.DEBUG)
+        await MongoDB.connect()
+        
+        print(f"🚀 Recovery System - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        if args.status:
+            await show_status()
+        elif args.cleanup:
+            await cleanup_old(args.cleanup)
+        else:
+            await show_status()
+            await run_recovery()
+            await show_status()
+        
+    except KeyboardInterrupt:
+        print("\n⏹️ Interrompido pelo usuário")
+    except Exception as e:
+        logger.error("Script failed", extra={"error": str(e)})
+        print(f"❌ Erro: {e}")
+        sys.exit(1)
+    finally:
+        await MongoDB.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+RECOVERY_SCRIPT_EOF
+
+    echo "  ✅ Script de recovery criado"
+}
+
+# Função para atualizar Interview entity
+update_interview_entity() {
+    echo -e "${YELLOW}✏️ Atualizando Interview entity...${NC}"
+    
+    # Verificar se já tem os campos
+    if grep -q "retry_count" app/domain/entities/interview.py; then
+        echo "  ⚠️ Interview entity já tem campos de retry"
+        return
+    fi
+    
+    # Fazer backup primeiro
+    cp app/domain/entities/interview.py app/domain/entities/interview.py.bak
+    
+    # Adicionar campos de retry antes do último método
+    sed -i '/def mark_processing/i\
+    # Recovery fields\
+    retry_count: int = 0\
+    last_retry_at: Optional[datetime] = None\
+' app/domain/entities/interview.py
+    
+    echo "  ✅ Interview entity atualizada"
+}
+
+# Função para atualizar main.py
+update_main_py() {
+    echo -e "${YELLOW}✏️ Atualizando main.py...${NC}"
+    
+    # Verificar se já tem recovery routes
+    if grep -q "recovery_router" app/main.py; then
+        echo "  ⚠️ Main.py já tem recovery routes"
+        return
+    fi
+    
+    # Fazer backup primeiro
+    cp app/main.py app/main.py.bak
+    
+    # Adicionar import e rota de recovery antes do @app.get("/")
+    sed -i '/@app.get("\/")/ i\
+# Recovery routes\
+try:\
+    from app.api.v1.recovery import router as recovery_router\
+    app.include_router(recovery_router, prefix="", tags=["recovery"])\
+    logger.info("Recovery endpoints enabled")\
+except ImportError as e:\
+    logger.warning("Recovery endpoints not available", extra={"error": str(e)})\
+\
+' app/main.py
+    
+    echo "  ✅ Main.py atualizado"
+}
+
+# Função para configurar permissões
+set_permissions() {
+    echo -e "${YELLOW}🔐 Configurando permissões...${NC}"
+    chmod +x scripts/recovery.py
+    echo -e "${GREEN}✅ Permissões configuradas${NC}"
+}
+
+# Função para testar a instalação
+test_installation() {
+    echo -e "${YELLOW}🧪 Testando instalação...${NC}"
+    
+    # Verificar se os arquivos foram criados
+    FILES_TO_CHECK=(
+        "app/services/recovery_service.py"
+        "app/api/v1/recovery.py"
+        "scripts/recovery.py"
+    )
+    
+    for file in "${FILES_TO_CHECK[@]}"; do
+        if [ -f "$file" ]; then
+            echo -e "  ✅ $file"
+        else
+            echo -e "  ❌ $file ${RED}(FALTANDO)${NC}"
+        fi
+    done
+    
+    # Testar sintaxe Python
+    echo -e "\n🐍 Verificando sintaxe Python..."
+    if python3 -m py_compile app/services/recovery_service.py 2>/dev/null; then
+        echo -e "  ✅ recovery_service.py"
+    else
+        echo -e "  ❌ recovery_service.py ${RED}(ERRO DE SINTAXE)${NC}"
+    fi
+    
+    if python3 -m py_compile scripts/recovery.py 2>/dev/null; then
+        echo -e "  ✅ scripts/recovery.py"
+    else
+        echo -e "  ❌ scripts/recovery.py ${RED}(ERRO DE SINTAXE)${NC}"
+    fi
+}
+
+# Função para mostrar próximos passos
+show_next_steps() {
+    echo -e "\n${GREEN}🎉 INSTALAÇÃO CONCLUÍDA!${NC}"
+    echo -e "${BLUE}=====================================${NC}"
+    echo ""
+    echo -e "${YELLOW}📋 PRÓXIMOS PASSOS:${NC}"
+    echo ""
+    echo "1. 🧪 TESTAR O RECOVERY:"
+    echo "   python scripts/recovery.py --status"
+    echo ""
+    echo "2. 🔄 EXECUTAR RECOVERY DAS ENTREVISTAS ÓRFÃS:"
+    echo "   python scripts/recovery.py"
+    echo ""
+    echo "3. 🌐 TESTAR VIA API:"
+    echo "   curl http://localhost:8000/recovery/status"
+    echo ""
+    echo "4. ⏰ CONFIGURAR CRON JOB (OPCIONAL):"
+    echo "   crontab -e"
+    echo "   # Adicionar linha:"
+    echo "   */10 * * * * cd $(pwd) && python scripts/recovery.py >> logs/recovery.log 2>&1"
+    echo ""
+    echo "5. 🚀 REINICIAR O BOT:"
+    echo "   # Ctrl+C para parar"
+    echo "   python -m app.main"
+    echo ""
+    echo -e "${GREEN}✨ Sistema de Recovery está pronto!${NC}"
+}
+
+# EXECUÇÃO PRINCIPAL
+main() {
+    echo "Executando deploy do sistema de recovery..."
+    
+    create_backup
+    create_directories
+    create_recovery_service
+    create_recovery_api
+    create_recovery_script
+    update_interview_entity
+    update_main_py
+    set_permissions
+    test_installation
+    show_next_steps
+}
+
+# Executar se não estiver sendo sourced
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+# --------------------------------------------------
 # Arquivo: ./requirements.txt
 # --------------------------------------------------
 aiohttp==3.9.1
@@ -2537,6 +5382,217 @@ websockets==15.0.1
 yarl==1.20.1
 
 # --------------------------------------------------
+# Arquivo: ./scripts/migrate_old_interviews.py
+# --------------------------------------------------
+#!/usr/bin/env python3
+"""
+Script para migrar entrevistas antigas para o novo formato
+"""
+
+import asyncio
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.infrastructure.database.mongodb import MongoDB
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.core.logging import setup_logging
+from app.core.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+async def migrate_interviews():
+    """Migra entrevistas antigas"""
+    try:
+        interview_repo = InterviewRepository()
+        collection = await interview_repo._get_collection()
+        
+        print("🔄 Migrando entrevistas antigas...")
+        
+        # Atualizar entrevistas que não têm campos de retry
+        result1 = await collection.update_many(
+            {"retry_count": {"$exists": False}},
+            {"$set": {"retry_count": 0}}
+        )
+        
+        result2 = await collection.update_many(
+            {"last_retry_at": {"$exists": False}},
+            {"$set": {"last_retry_at": None}}
+        )
+        
+        # Remover campo simple_mode se existir
+        result3 = await collection.update_many(
+            {"simple_mode": {"$exists": True}},
+            {"$unset": {"simple_mode": ""}}
+        )
+        
+        print(f"✅ Migração concluída:")
+        print(f"   - retry_count adicionado: {result1.modified_count}")
+        print(f"   - last_retry_at adicionado: {result2.modified_count}")
+        print(f"   - simple_mode removido: {result3.modified_count}")
+        
+    except Exception as e:
+        print(f"❌ Erro na migração: {e}")
+
+async def main():
+    setup_logging(debug=settings.DEBUG)
+    await MongoDB.connect()
+    await migrate_interviews()
+    await MongoDB.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# --------------------------------------------------
+# Arquivo: ./scripts/recovery.py
+# --------------------------------------------------
+#!/usr/bin/env python3
+"""
+Recovery Script - Recupera entrevistas órfãs e com falhas
+
+Usage:
+  python scripts/recovery.py              # Executa recovery completo
+  python scripts/recovery.py --status     # Apenas mostra status
+  python scripts/recovery.py --cleanup 30 # Remove entrevistas antigas (30+ dias)
+"""
+
+import asyncio
+import sys
+import os
+import argparse
+
+# Adicionar o diretório do projeto ao path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.services.recovery_service import RecoveryService
+from app.infrastructure.database.mongodb import MongoDB
+from app.infrastructure.database.repositories.interview import InterviewRepository
+from app.core.logging import setup_logging
+from app.core.config import settings
+import logging
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+
+async def show_status():
+    """Mostra status das entrevistas"""
+    try:
+        interview_repo = InterviewRepository()
+        collection = await interview_repo._get_collection()
+        
+        print("\n📊 STATUS DAS ENTREVISTAS")
+        print("=" * 50)
+        
+        # Contar por status
+        pipeline = [{"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+        
+        status_counts = {}
+        async for doc in collection.aggregate(pipeline):
+            status_counts[doc["_id"]] = doc["count"]
+        
+        for status, count in status_counts.items():
+            print(f"{status.upper()}: {count}")
+        
+        # Entrevistas órfãs
+        cutoff_time = datetime.now() - timedelta(minutes=60)
+        orphaned_count = await collection.count_documents({
+            "status": {"$in": ["processing", "transcribing", "analyzing"]},
+            "started_at": {"$lt": cutoff_time}
+        })
+        
+        print(f"\n🚨 ÓRFÃS (>1h processando): {orphaned_count}")
+        
+        # Entrevistas para retry
+        retry_cutoff = datetime.now() - timedelta(minutes=5)
+        retry_count = await collection.count_documents({
+            "status": "failed",
+            "retry_count": {"$lt": 3},
+            "last_retry_at": {"$lt": retry_cutoff}
+        })
+        
+        print(f"🔄 PRONTAS PARA RETRY: {retry_count}")
+        print(f"📈 TOTAL: {sum(status_counts.values())}")
+        
+    except Exception as e:
+        logger.error("Failed to show status", extra={"error": str(e)})
+        print(f"❌ Erro ao buscar status: {e}")
+
+
+async def run_recovery():
+    """Executa recovery completo"""
+    try:
+        print("\n🔄 INICIANDO RECOVERY...")
+        
+        recovery_service = RecoveryService()
+        await recovery_service.run_recovery_cycle()
+        
+        print("✅ Recovery concluído com sucesso!")
+        
+    except Exception as e:
+        logger.error("Recovery failed", extra={"error": str(e)})
+        print(f"❌ Recovery falhou: {e}")
+
+
+async def cleanup_old(days: int):
+    """Remove entrevistas antigas"""
+    try:
+        if days < 7:
+            print("❌ Mínimo de 7 dias para cleanup")
+            return
+        
+        print(f"\n🗑️ LIMPANDO ENTREVISTAS COM {days}+ DIAS...")
+        
+        recovery_service = RecoveryService()
+        await recovery_service.cleanup_old_interviews(days)
+        
+        print("✅ Cleanup concluído!")
+        
+    except Exception as e:
+        logger.error("Cleanup failed", extra={"error": str(e)})
+        print(f"❌ Cleanup falhou: {e}")
+
+
+async def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(description="Recovery System for Interview Bot")
+    parser.add_argument("--status", action="store_true", help="Show status only")
+    parser.add_argument("--cleanup", type=int, metavar="DAYS", help="Cleanup interviews older than N days")
+    
+    args = parser.parse_args()
+    
+    try:
+        # Setup
+        setup_logging(debug=settings.DEBUG)
+        await MongoDB.connect()
+        
+        print(f"🚀 Recovery System - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        if args.status:
+            await show_status()
+        elif args.cleanup:
+            await cleanup_old(args.cleanup)
+        else:
+            await show_status()
+            await run_recovery()
+            await show_status()
+        
+    except KeyboardInterrupt:
+        print("\n⏹️ Interrompido pelo usuário")
+    except Exception as e:
+        logger.error("Script failed", extra={"error": str(e)})
+        print(f"❌ Erro: {e}")
+        sys.exit(1)
+    finally:
+        await MongoDB.disconnect()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+# --------------------------------------------------
 # Arquivo: ./scripts/run.sh
 # --------------------------------------------------
 #!/bin/bash
@@ -2599,6 +5655,132 @@ echo "3. Run: source venv/bin/activate"
 echo "4. Run: python -m app.main"
 
 # --------------------------------------------------
+# Arquivo: ./scripts/setup_telegram.py
+# --------------------------------------------------
+#!/usr/bin/env python3
+"""
+Script to set up Telegram webhook for the Interview Bot
+"""
+import asyncio
+import aiohttp
+import sys
+from typing import Optional
+
+
+async def set_telegram_webhook(bot_token: str, webhook_url: str) -> bool:
+    """Set Telegram webhook URL"""
+    url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
+    
+    data = {
+        "url": webhook_url,
+        "allowed_updates": ["message"]
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data) as response:
+            result = await response.json()
+            
+            if result.get("ok"):
+                print(f"✅ Telegram webhook set successfully!")
+                print(f"📍 Webhook URL: {webhook_url}")
+                return True
+            else:
+                print(f"❌ Failed to set webhook: {result.get('description')}")
+                return False
+
+
+async def get_webhook_info(bot_token: str) -> Optional[dict]:
+    """Get current webhook information"""
+    url = f"https://api.telegram.org/bot{bot_token}/getWebhookInfo"
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            result = await response.json()
+            
+            if result.get("ok"):
+                return result["result"]
+            return None
+
+
+async def get_bot_info(bot_token: str) -> Optional[dict]:
+    """Get bot information"""
+    url = f"https://api.telegram.org/bot{bot_token}/getMe"
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            result = await response.json()
+            
+            if result.get("ok"):
+                return result["result"]
+            return None
+
+
+async def main():
+    if len(sys.argv) < 3:
+        print("Usage: python setup_telegram.py <BOT_TOKEN> <YOUR_DOMAIN>")
+        print("Example: python setup_telegram.py 123456:ABC-DEF https://yourdomain.com")
+        sys.exit(1)
+    
+    bot_token = sys.argv[1]
+    domain = sys.argv[2].rstrip('/')
+    webhook_url = f"{domain}/webhook/telegram"
+    
+    print("🤖 Setting up Telegram Bot...")
+    print(f"📱 Bot Token: {bot_token[:10]}...")
+    print(f"🌐 Domain: {domain}")
+    print(f"🔗 Webhook URL: {webhook_url}")
+    print()
+    
+    # Get bot info
+    print("📋 Getting bot information...")
+    bot_info = await get_bot_info(bot_token)
+    if bot_info:
+        print(f"✅ Bot: @{bot_info['username']} ({bot_info['first_name']})")
+        print(f"🆔 Bot ID: {bot_info['id']}")
+    else:
+        print("❌ Invalid bot token")
+        sys.exit(1)
+    
+    print()
+    
+    # Check current webhook
+    print("🔍 Checking current webhook...")
+    webhook_info = await get_webhook_info(bot_token)
+    if webhook_info:
+        current_url = webhook_info.get("url", "")
+        if current_url:
+            print(f"📍 Current webhook: {current_url}")
+        else:
+            print("📍 No webhook currently set")
+        
+        print(f"🔄 Pending updates: {webhook_info.get('pending_update_count', 0)}")
+    
+    print()
+    
+    # Set new webhook
+    print("⚙️ Setting new webhook...")
+    success = await set_telegram_webhook(bot_token, webhook_url)
+    
+    if success:
+        print()
+        print("🎉 Setup complete!")
+        print()
+        print("📝 Next steps:")
+        print("1. Add TELEGRAM_BOT_TOKEN=<your_token> to your .env file")
+        print("2. Make sure your server is running and accessible")
+        print("3. Test by sending a message to your bot")
+        print()
+        print("🧪 Test commands:")
+        print("- Send 'help' to see bot features")
+        print("- Send voice message to test transcription")
+    else:
+        print("❌ Setup failed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+# --------------------------------------------------
 # Arquivo: ./scripts/test.sh
 # --------------------------------------------------
 #!/bin/bash
@@ -2610,7 +5792,7 @@ set -e
 echo "🧪 Running tests..."
 
 # Activate virtual environment
-source venv/bin/activate
+source .venv/bin/activate
 
 # Run tests
 pytest tests/ -v --tb=short
@@ -2622,6 +5804,191 @@ mypy app/
 
 echo "✅ All tests passed!"
 
+# --------------------------------------------------
+# Arquivo: ./scripts/test_providers.py
+# --------------------------------------------------
+#!/usr/bin/env python3
+"""
+Test script to verify both WhatsApp and Telegram providers work correctly
+"""
+import asyncio
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.infrastructure.messaging.factory import MessagingProviderFactory
+from app.infrastructure.messaging.base import MessageType, StandardMessage
+
+
+async def test_whatsapp_provider():
+    """Test WhatsApp provider instantiation and basic methods"""
+    print("🟢 Testing WhatsApp Provider...")
+    
+    try:
+        provider = MessagingProviderFactory.create_provider("whatsapp")
+        print(f"✅ WhatsApp provider created: {type(provider).__name__}")
+        
+        # Test webhook validation (mock data)
+        mock_whatsapp_data = {
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [
+                            {
+                                "id": "test_msg_123",
+                                "type": "text",
+                                "from": "5511999999999",
+                                "timestamp": "1234567890",
+                                "text": {"body": "Hello"}
+                            }
+                        ]
+                    }
+                }]
+            }]
+        }
+        
+        is_valid = provider.validate_webhook(mock_whatsapp_data, {})
+        print(f"✅ Webhook validation: {is_valid}")
+        
+        # Test message extraction
+        message = provider.extract_message_data(mock_whatsapp_data)
+        if message:
+            print(f"✅ Message extraction: {message.message_type.value} from {message.from_number}")
+        else:
+            print("❌ Message extraction failed")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ WhatsApp provider error: {e}")
+        return False
+
+
+async def test_telegram_provider():
+    """Test Telegram provider instantiation and basic methods"""
+    print("\n🔵 Testing Telegram Provider...")
+    
+    try:
+        provider = MessagingProviderFactory.create_provider("telegram")
+        print(f"✅ Telegram provider created: {type(provider).__name__}")
+        
+        # Test webhook validation (mock data)
+        mock_telegram_data = {
+            "message": {
+                "message_id": 123,
+                "chat": {"id": 456789},
+                "date": 1234567890,
+                "text": "Hello from Telegram"
+            }
+        }
+        
+        is_valid = provider.validate_webhook(mock_telegram_data, {})
+        print(f"✅ Webhook validation: {is_valid}")
+        
+        # Test message extraction
+        message = provider.extract_message_data(mock_telegram_data)
+        if message:
+            print(f"✅ Message extraction: {message.message_type.value} from {message.from_number}")
+        else:
+            print("❌ Message extraction failed")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Telegram provider error: {e}")
+        return False
+
+
+async def test_factory():
+    """Test messaging provider factory"""
+    print("\n🏭 Testing Provider Factory...")
+    
+    try:
+        # Test available providers
+        providers = MessagingProviderFactory.get_available_providers()
+        print(f"✅ Available providers: {providers}")
+        
+        # Test default provider
+        default = MessagingProviderFactory.get_default_provider()
+        print(f"✅ Default provider: {type(default).__name__}")
+        
+        # Test both providers
+        wa_provider = MessagingProviderFactory.create_provider("whatsapp")
+        tg_provider = MessagingProviderFactory.create_provider("telegram")
+        
+        print(f"✅ WhatsApp: {type(wa_provider).__name__}")
+        print(f"✅ Telegram: {type(tg_provider).__name__}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Factory error: {e}")
+        return False
+
+
+async def test_standard_message():
+    """Test StandardMessage class"""
+    print("\n📨 Testing StandardMessage...")
+    
+    try:
+        # Test text message
+        text_msg = StandardMessage(
+            from_number="123456789",
+            message_type=MessageType.TEXT,
+            message_id="msg_123",
+            content="Hello world"
+        )
+        
+        print(f"✅ Text message: {text_msg.to_dict()}")
+        
+        # Test audio message
+        audio_msg = StandardMessage(
+            from_number="987654321",
+            message_type=MessageType.AUDIO,
+            message_id="msg_456",
+            media_id="audio_123"
+        )
+        
+        print(f"✅ Audio message: {audio_msg.to_dict()}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ StandardMessage error: {e}")
+        return False
+
+
+async def main():
+    """Run all tests"""
+    print("🧪 Testing Messaging Providers\n")
+    
+    results = []
+    
+    # Run tests
+    results.append(await test_factory())
+    results.append(await test_standard_message())
+    results.append(await test_whatsapp_provider())
+    results.append(await test_telegram_provider())
+    
+    # Summary
+    passed = sum(results)
+    total = len(results)
+    
+    print(f"\n📊 Test Results: {passed}/{total} tests passed")
+    
+    if passed == total:
+        print("🎉 All tests passed! Both providers are working correctly.")
+        print("\n📝 Next steps:")
+        print("1. Set up your .env file with tokens")
+        print("2. Configure webhooks for your providers")
+        print("3. Deploy and test with real messages")
+    else:
+        print("❌ Some tests failed. Check the errors above.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 # --------------------------------------------------
 # Arquivo: ./tests/test_main.py
 # --------------------------------------------------

@@ -16,11 +16,17 @@ class Settings(BaseSettings):
     DEBUG: bool = False
     ENVIRONMENT: str = "development"
     
+    # Messaging Providers
+    DEFAULT_MESSAGING_PROVIDER: str = "whatsapp"
+    
     # WhatsApp
     WHATSAPP_TOKEN: str
     WHATSAPP_VERIFY_TOKEN: str
     PHONE_NUMBER_ID: str
     WHATSAPP_API_VERSION: str = "v18.0"
+    
+    # Telegram
+    TELEGRAM_BOT_TOKEN: Optional[str] = None
     
     # AI Services
     OPENAI_API_KEY: str

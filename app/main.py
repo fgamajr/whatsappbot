@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import logging
 
-from app.api.v1 import webhooks, health
+from app.api.v1 import webhooks, health, messaging
 from app.api.middleware.error_handler import ErrorHandlerMiddleware
 from app.core.config import settings
 from app.core.logging import setup_logging
@@ -41,7 +41,8 @@ app.add_middleware(ErrorHandlerMiddleware)
 
 # Routes
 app.include_router(health.router, prefix="/health", tags=["health"])
-app.include_router(webhooks.router, prefix="/webhook", tags=["whatsapp"])
+app.include_router(webhooks.router, prefix="/webhook", tags=["whatsapp"])  # Legacy WhatsApp endpoint
+app.include_router(messaging.router, prefix="/webhook", tags=["messaging"])  # New multi-provider endpoints
 
 
 # Recovery routes
