@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     
     # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
+    TELEGRAM_API_ID: Optional[int] = None
+    TELEGRAM_API_HASH: Optional[str] = None
     
     # AI Services
     OPENAI_API_KEY: str

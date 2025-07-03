@@ -15,5 +15,5 @@ if [ "$1" = "dev" ]; then
     uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 else
     echo "🏃 Running in production mode..."
-    gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000
+    gunicorn app.main:app -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:8000 -t 3000
 fi

@@ -10,26 +10,88 @@ logger = logging.getLogger(__name__)
 class AudioProcessor:
     def __init__(self, chunk_duration_minutes: int = 15):
         self.chunk_duration_minutes = chunk_duration_minutes
+        # Limites inteligentes após conversão
+        self.max_converted_size_mb = 25  # Whisper API limit
+        self.max_memory_size_mb = 100    # Limite de memória razoável
     
     def convert_to_mp3(self, audio_bytes: bytes) -> bytes:
-        """Convert any audio format to MP3"""
+        """Convert any audio format to MP3 with intelligent validation"""
         try:
+            original_size_mb = len(audio_bytes) / (1024 * 1024)
+            
+            logger.info("Starting audio conversion", extra={
+                "original_size_bytes": len(audio_bytes),
+                "original_size_mb": round(original_size_mb, 1)
+            })
+            
+            # Carregar áudio (suporta qualquer formato)
             audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
             
+            # Conversão inteligente baseada no tamanho original
+            if original_size_mb > 50:
+                # Arquivo muito grande - compressão agressiva
+                export_params = ["-q:a", "9", "-ar", "22050"]  # Qualidade mais baixa
+                logger.info("Using aggressive compression for large file")
+            elif original_size_mb > 20:
+                # Arquivo médio - compressão moderada
+                export_params = ["-q:a", "7", "-ar", "44100"]  # Qualidade média
+                logger.info("Using moderate compression")
+            else:
+                # Arquivo pequeno - compressão leve
+                export_params = ["-q:a", "5", "-ar", "44100"]  # Qualidade boa
+                logger.info("Using light compression")
+            
             mp3_buffer = io.BytesIO()
-            audio.export(mp3_buffer, format="mp3")
+            audio.export(mp3_buffer, format="mp3", parameters=export_params)
             mp3_bytes = mp3_buffer.getvalue()
             
-            logger.info("Audio converted to MP3", extra={
-                "original_size": len(audio_bytes),
-                "mp3_size": len(mp3_bytes)
+            converted_size_mb = len(mp3_bytes) / (1024 * 1024)
+            compression_ratio = original_size_mb / converted_size_mb if converted_size_mb > 0 else 1
+            
+            logger.info("Audio conversion completed", extra={
+                "original_size_mb": round(original_size_mb, 1),
+                "converted_size_mb": round(converted_size_mb, 1),
+                "compression_ratio": round(compression_ratio, 1),
+                "size_reduction_percent": round((1 - converted_size_mb/original_size_mb) * 100, 1)
             })
+            
+            # VALIDAÇÃO INTELIGENTE - APÓS conversão
+            if converted_size_mb > self.max_converted_size_mb:
+                error_msg = (
+                    f"Áudio convertido muito grande para processamento!\n\n"
+                    f"📁 Arquivo original: {original_size_mb:.1f}MB\n"
+                    f"🎵 Áudio convertido: {converted_size_mb:.1f}MB\n"
+                    f"🚫 Limite para transcrição: {self.max_converted_size_mb}MB\n\n"
+                    f"💡 Soluções:\n"
+                    f"• Enviar áudio mais curto (menos tempo)\n"
+                    f"• Usar qualidade de gravação menor\n"
+                    f"• Dividir em partes menores\n"
+                    f"• Comprimir ainda mais antes de enviar"
+                )
+                
+                logger.error("Converted audio exceeds processing limit", extra={
+                    "original_size_mb": original_size_mb,
+                    "converted_size_mb": converted_size_mb,
+                    "limit_mb": self.max_converted_size_mb
+                })
+                
+                raise AudioProcessingError(error_msg)
+            
+            if converted_size_mb > self.max_memory_size_mb:
+                logger.warning("Audio file is very large, may cause memory issues", extra={
+                    "converted_size_mb": converted_size_mb,
+                    "memory_limit_mb": self.max_memory_size_mb
+                })
             
             return mp3_bytes
             
+        except AudioProcessingError:
+            # Re-raise nossa exceção customizada
+            raise
         except Exception as e:
             logger.error("Audio conversion failed", extra={
-                "error": str(e)
+                "error": str(e),
+                "original_size_mb": len(audio_bytes) / (1024 * 1024)
             })
             raise AudioProcessingError(f"Failed to convert audio: {str(e)}")
     

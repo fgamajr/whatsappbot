@@ -85,7 +85,7 @@ class WhisperService:
         except openai.APIStatusError as e:
             # --- Detailed tracing for API errors is active ---
             print("\n\n================================================")
-            print(">>> WHISPER API ERROR (e.g., auth, billing) <<<")
+            print("🚨 Tipo: API Error (auth/billing/quota)")
             traceback.print_exc()
             print("================================================\n\n")
             
@@ -103,7 +103,7 @@ class WhisperService:
         except Exception as e:
             # --- Detailed tracing for unexpected errors is active ---
             print("\n\n================================================")
-            print(">>> UNEXPECTED WHISPER ERROR (e.g., network) <<<")
+            print("🚨 Tipo: Unexpected Error (network/etc)")
             traceback.print_exc()
             print("================================================\n\n")
 
