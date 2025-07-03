@@ -253,5 +253,5 @@ class MessageHandler:
                 try:
                     if path and os.path.exists(path):
                         os.remove(path)
-                except:
-                    pass
+                except (OSError, IOError, FileNotFoundError) as e:
+                    logger.warning(f"Failed to remove file {path}: {e}")

@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from typing import Dict
 import logging
 from app.infrastructure.database.mongodb import MongoDB
+from app.infrastructure.redis_client import redis_client
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,10 @@ async def readiness():
     except Exception as e:
         health_status["services"]["mongodb"] = f"error: {str(e)}"
         health_status["status"] = "unhealthy"
+    
+    # Check Redis (optional)
+    redis_health = await redis_client.health_check()
+    health_status["services"]["redis"] = redis_health
     
     # Check AI services configuration
     health_status["services"]["openai"] = "configured" if settings.OPENAI_API_KEY else "missing_key"

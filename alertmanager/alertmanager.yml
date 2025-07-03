@@ -1,0 +1,49 @@
+global:
+  smtp_smarthost: 'localhost:587'
+  smtp_from: 'alerts@whatsapp-bot.com'
+  smtp_auth_username: 'alerts@whatsapp-bot.com'
+  smtp_auth_password: 'your-email-password'
+
+route:
+  group_by: ['alertname']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'web.hook'
+
+receivers:
+- name: 'web.hook'
+  webhook_configs:
+  - url: 'http://host.docker.internal:8000/alerts/webhook'
+    send_resolved: true
+
+- name: 'email'
+  email_configs:
+  - to: 'admin@whatsapp-bot.com'
+    subject: 'WhatsApp Bot Alert: {{ .GroupLabels.alertname }}'
+    body: |
+      {{ range .Alerts }}
+      Alert: {{ .Annotations.summary }}
+      Description: {{ .Annotations.description }}
+      Labels: {{ .Labels }}
+      {{ end }}
+
+- name: 'slack'
+  slack_configs:
+  - api_url: 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK'
+    channel: '#alerts'
+    username: 'WhatsApp Bot'
+    icon_emoji: ':robot_face:'
+    title: 'WhatsApp Bot Alert'
+    text: |
+      {{ range .Alerts }}
+      {{ .Annotations.summary }}
+      {{ .Annotations.description }}
+      {{ end }}
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'dev', 'instance']

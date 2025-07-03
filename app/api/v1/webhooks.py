@@ -4,6 +4,8 @@ import logging
 from app.services.message_handler import MessageHandler
 from app.domain.value_objects.phone_number import BrazilianPhoneNumber
 from app.core.config import settings
+from app.utils.webhook_security import WebhookSecurityValidator
+from app.utils.input_sanitizer import InputSanitizer
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -31,7 +33,25 @@ async def verify_webhook(request: Request):
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
     """Main webhook endpoint - immediate response with background processing"""
     try:
-        data = await request.json()
+        # Get raw body for signature verification
+        body = await request.body()
+        
+        # Verify webhook signature
+        await WebhookSecurityValidator.verify_whatsapp_signature(request, body)
+        
+        # Parse JSON after signature verification
+        import json
+        data = json.loads(body.decode('utf-8'))
+        
+        # Validate and sanitize webhook data
+        try:
+            data = InputSanitizer.validate_webhook_data(data)
+        except ValueError as e:
+            logger.warning("Invalid webhook data received", extra={
+                "error": str(e),
+                "source_ip": WebhookSecurityValidator.get_client_ip(request)
+            })
+            return Response(status_code=400)
         
         # Quick validation
         if not _is_valid_message(data):
@@ -114,12 +134,26 @@ def _extract_message_data(data: dict) -> Dict:
         if len(processed_messages) > settings.MAX_CACHE_SIZE:
             processed_messages.clear()
         
+        # Sanitize phone number first
+        try:
+            from_number = InputSanitizer.sanitize_phone_number(from_number)
+        except ValueError as e:
+            logger.warning("Phone number sanitization failed", extra={
+                "original_number": from_number,
+                "error": str(e)
+            })
+            return None
+        
         # Validate and fix phone number
         try:
             phone = BrazilianPhoneNumber(number=from_number)
             from_number = phone.number
-        except:
-            pass  # Use original number if validation fails
+        except (ValueError, TypeError) as e:
+            logger.warning("Phone number validation failed", extra={
+                "original_number": from_number,
+                "error": str(e)
+            })
+            # Use original number if validation fails
         
         result = {
             "from": from_number,
@@ -129,9 +163,25 @@ def _extract_message_data(data: dict) -> Dict:
         }
         
         if message_type == "audio":
-            result["media_id"] = messages["audio"]["id"]
+            try:
+                media_id = InputSanitizer.sanitize_media_id(messages["audio"]["id"])
+                result["media_id"] = media_id
+            except ValueError as e:
+                logger.warning("Invalid media ID", extra={
+                    "media_id": messages["audio"]["id"],
+                    "error": str(e)
+                })
+                return None
         elif message_type == "text":
-            result["content"] = messages["text"]["body"]
+            try:
+                text_content = InputSanitizer.sanitize_text_message(messages["text"]["body"])
+                result["content"] = text_content
+            except ValueError as e:
+                logger.warning("Invalid text message content", extra={
+                    "content_preview": messages["text"]["body"][:100],
+                    "error": str(e)
+                })
+                return None
         
         return result
         

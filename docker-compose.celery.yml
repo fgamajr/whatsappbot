@@ -1,0 +1,204 @@
+version: '3.8'
+
+services:
+  # Redis for Rate Limiting (existing DB 0)
+  redis:
+    image: redis:7.2-alpine
+    hostname: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # FastAPI Application
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    hostname: app
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      # Redis configurations for different purposes
+      - REDIS_URL=redis://redis:6379/0              # Rate limiting
+      - CELERY_BROKER_URL=redis://redis:6379/1      # Celery broker
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2  # Celery results
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Celery Worker - Audio Processing Queue
+  celery-worker-audio:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    hostname: celery-worker-audio
+    command: celery -A app.celery_app worker -l info -Q audio_processing -c 2 --prefetch-multiplier=1
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.celery_app", "inspect", "ping"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  # Celery Worker - Document Generation Queue  
+  celery-worker-docs:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    hostname: celery-worker-docs
+    command: celery -A app.celery_app worker -l info -Q document_generation -c 3 --prefetch-multiplier=1
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - app
+    restart: unless-stopped
+
+  # Celery Worker - General Purpose (default + maintenance)
+  celery-worker-general:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    hostname: celery-worker-general
+    command: celery -A app.celery_app worker -l info -Q default,maintenance,high_priority -c 4 --prefetch-multiplier=1
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - app
+    restart: unless-stopped
+
+  # Celery Beat - Periodic Tasks Scheduler
+  celery-beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    hostname: celery-beat
+    command: celery -A app.celery_app beat -l info --scheduler=celery.beat:PersistentScheduler
+    environment:
+      - ENVIRONMENT=development
+      - DEBUG=true
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./logs:/app/logs
+      - celery_beat_data:/app/celerybeat-schedule  # Persist beat schedule
+    depends_on:
+      - redis
+      - app
+    restart: unless-stopped
+
+  # Flower - Celery Monitoring Web UI
+  flower:
+    image: mher/flower:2.0
+    hostname: flower
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - FLOWER_BASIC_AUTH=admin:admin123  # Change in production!
+    command: celery --broker=redis://redis:6379/1 flower --port=5555
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # Optional: Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123  # Change in production!
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana:/etc/grafana/provisioning
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  celery_beat_data:
+  prometheus_data:
+  grafana_data:

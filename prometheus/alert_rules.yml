@@ -1,0 +1,116 @@
+groups:
+- name: celery_alerts
+  rules:
+  # High queue length alert
+  - alert: HighQueueLength
+    expr: celery_queue_length > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High queue length detected"
+      description: "Queue {{ $labels.queue_name }} has {{ $value }} tasks waiting for more than 5 minutes"
+
+  # No active workers alert
+  - alert: NoActiveWorkers
+    expr: celery_system_total_workers == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "No active Celery workers"
+      description: "No active Celery workers detected for 2 minutes"
+
+  # High error rate alert
+  - alert: HighErrorRate
+    expr: celery_system_error_rate_percent > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High error rate detected"
+      description: "Error rate is {{ $value }}% for more than 5 minutes"
+
+  # Pipeline duration alert
+  - alert: LongPipelineDuration
+    expr: histogram_quantile(0.95, rate(celery_pipeline_duration_seconds_bucket[5m])) > 1800
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Pipeline taking too long"
+      description: "95th percentile of pipeline duration is {{ $value }} seconds"
+
+  # Task failure rate alert
+  - alert: HighTaskFailureRate
+    expr: rate(celery_tasks_total{status="failure"}[5m]) / rate(celery_tasks_total[5m]) > 0.1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High task failure rate"
+      description: "Task failure rate is {{ $value | humanizePercentage }} for more than 5 minutes"
+
+  # Auto-scaling failure alert
+  - alert: AutoScalingStuck
+    expr: increase(celery_autoscaling_decisions_total[15m]) == 0 and celery_queue_length > 5
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Auto-scaling not responding"
+      description: "No auto-scaling decisions made in 15 minutes despite high queue length"
+
+- name: system_alerts
+  rules:
+  # High CPU usage alert
+  - alert: HighCPUUsage
+    expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage detected"
+      description: "CPU usage is {{ $value }}% for more than 5 minutes"
+
+  # High memory usage alert
+  - alert: HighMemoryUsage
+    expr: (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100 > 85
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage detected"
+      description: "Memory usage is {{ $value }}% for more than 5 minutes"
+
+  # Disk space alert
+  - alert: LowDiskSpace
+    expr: (node_filesystem_size_bytes{fstype!="tmpfs"} - node_filesystem_free_bytes{fstype!="tmpfs"}) / node_filesystem_size_bytes{fstype!="tmpfs"} * 100 > 90
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Low disk space"
+      description: "Disk usage is {{ $value }}% on {{ $labels.mountpoint }}"
+
+- name: websocket_alerts
+  rules:
+  # Too many WebSocket connections
+  - alert: HighWebSocketConnections
+    expr: sum(websocket_active_connections) > 100
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High number of WebSocket connections"
+      description: "{{ $value }} active WebSocket connections detected"
+
+  # WebSocket message rate too high
+  - alert: HighWebSocketMessageRate
+    expr: rate(websocket_messages_sent_total[5m]) > 10
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High WebSocket message rate"
+      description: "WebSocket message rate is {{ $value }} messages/second"

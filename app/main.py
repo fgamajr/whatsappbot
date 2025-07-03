@@ -4,9 +4,15 @@ import logging
 
 from app.api.v1 import webhooks, health, messaging
 from app.api.middleware.error_handler import ErrorHandlerMiddleware
+from app.api.middleware.redis_rate_limiter import RedisRateLimiterMiddleware
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.infrastructure.database.mongodb import MongoDB
+from app.infrastructure.redis_client import redis_client
+from app.celery_app import celery_app
+from app.infrastructure.prometheus_metrics import prometheus_metrics
+from app.infrastructure.metrics_collector import metrics_collector
+from app.infrastructure.auto_scaler import auto_scaler
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +27,39 @@ async def lifespan(app: FastAPI):
     })
     
     await MongoDB.connect()
+    await redis_client.connect()
+    
+    # Verify Celery connection
+    try:
+        # Test Celery broker connection
+        celery_app.control.inspect().stats()
+        logger.info("Celery broker connection verified")
+    except Exception as e:
+        logger.warning(f"Celery broker connection failed: {e}")
+    
+    # Start monitoring services
+    try:
+        # Start Prometheus metrics server
+        prometheus_metrics.start_metrics_server(8001)
+        
+        # Start metrics collector
+        import asyncio
+        asyncio.create_task(metrics_collector.start_collection())
+        
+        # Start auto-scaler
+        asyncio.create_task(auto_scaler.start_auto_scaling())
+        
+        logger.info("Monitoring services started successfully")
+    except Exception as e:
+        logger.warning(f"Failed to start monitoring services: {e}")
     
     yield
     
     # Shutdown
+    metrics_collector.stop_collection()
+    auto_scaler.stop_auto_scaling()
     await MongoDB.disconnect()
+    await redis_client.disconnect()
     logger.info("Interview Bot shutdown complete")
 
 
@@ -38,11 +72,21 @@ app = FastAPI(
 
 # Middleware
 app.add_middleware(ErrorHandlerMiddleware)
+app.add_middleware(RedisRateLimiterMiddleware)
 
 # Routes
 app.include_router(health.router, prefix="/health", tags=["health"])
 app.include_router(webhooks.router, prefix="/webhook", tags=["whatsapp"])  # Legacy WhatsApp endpoint
 app.include_router(messaging.router, prefix="/webhook", tags=["messaging"])  # New multi-provider endpoints
+
+# Celery test endpoints (only in development)
+if settings.DEBUG:
+    from app.api.v1 import celery_test
+    app.include_router(celery_test.router, prefix="/celery", tags=["celery"])
+
+# Monitoring endpoints
+from app.api.endpoints import monitoring
+app.include_router(monitoring.router, tags=["monitoring"])
 
 
 # Recovery routes

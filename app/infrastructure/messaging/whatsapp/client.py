@@ -282,8 +282,9 @@ class WhatsAppProvider(MessagingProvider):
             try:
                 phone = BrazilianPhoneNumber(number=from_number)
                 from_number = phone.number
-            except:
-                pass  # Use original number if validation fails
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Phone number validation failed for {from_number}: {e}")
+                # Use original number if validation fails
             
             # Convert to standard message type
             if message_type_str == "audio":

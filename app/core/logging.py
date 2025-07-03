@@ -3,9 +3,10 @@ import sys
 from typing import Dict, Any
 import json
 from datetime import datetime
+from app.utils.secure_logging import SecureLogFormatter, SecureLogger
 
 
-class StructuredFormatter(logging.Formatter):
+class StructuredFormatter(SecureLogFormatter):
     """Custom formatter for structured logging"""
     
     def format(self, record: logging.LogRecord) -> str:
@@ -19,11 +20,26 @@ class StructuredFormatter(logging.Formatter):
             "line": record.lineno,
         }
         
-        # Add extra fields if present
+        # Add extra fields if present (sanitized)
         if hasattr(record, "extra"):
-            log_data.update(record.extra)
-            
-        return json.dumps(log_data, ensure_ascii=False)
+            sanitized_extra = SecureLogger.sanitize_dict(record.extra)
+            log_data.update(sanitized_extra)
+        
+        # Convert to JSON and apply parent class sanitization
+        json_str = json.dumps(log_data, ensure_ascii=False)
+        
+        # Apply additional sanitization from parent class
+        return super(SecureLogFormatter, self).format(
+            logging.LogRecord(
+                name=record.name,
+                level=record.levelno,
+                pathname=record.pathname,
+                lineno=record.lineno,
+                msg=json_str,
+                args=(),
+                exc_info=None
+            )
+        )
 
 
 def setup_logging(debug: bool = False) -> None:

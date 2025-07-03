@@ -252,8 +252,13 @@ class TelegramProvider(MessagingProvider):
                                         "response": response_text
                                     })
                                     return False
-                            except:
-                                print(f"🐛 ❌ Erro ao processar JSON da resposta")
+                            except (aiohttp.ContentTypeError, ValueError, KeyError) as e:
+                                print(f"🐛 ❌ Erro ao processar JSON da resposta: {e}")
+                                logger.error("Failed to parse response JSON", extra={
+                                    "chat_id": to,
+                                    "error": str(e),
+                                    "response": response_text
+                                })
                                 return False
                         else:
                             print(f"🐛 ❌ Falha no upload! Status: {response.status}")
