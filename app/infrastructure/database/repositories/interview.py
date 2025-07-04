@@ -1,138 +1,90 @@
-from typing import Optional, List
-from motor.motor_asyncio import AsyncIOMotorCollection
+from typing import Optional, List, Dict, Any
+from pymongo import MongoClient
+from bson.objectid import ObjectId
 from app.domain.entities.interview import Interview, InterviewStatus
-from app.infrastructure.database.mongodb import MongoDB
+from app.core.config import settings
 from app.core.exceptions import DatabaseError
 import logging
 
 logger = logging.getLogger(__name__)
 
-
 class InterviewRepository:
-    def __init__(self):
-        self.collection: AsyncIOMotorCollection = None
-    
-    async def _get_collection(self) -> AsyncIOMotorCollection:
-        if self.collection is None:
-            db = await MongoDB.get_database()
-            self.collection = db.interviews
-            
-            # Create indexes
-            await self.collection.create_index("phone_number")
-            await self.collection.create_index("message_id", unique=True)
-            await self.collection.create_index("created_at")
-            await self.collection.create_index("status")
-            
-        return self.collection
+    _instance = None
+    _client = None
+    _db = None
 
-    
-    async def create(self, interview: Interview) -> Interview:
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(InterviewRepository, cls).__new__(cls)
+            try:
+                cls._client = MongoClient(settings.MONGODB_URL)
+                cls._db = cls._client[settings.DB_NAME]
+                logger.info("MongoDB connection established for InterviewRepository.")
+                # Create indexes on first instantiation
+                cls._create_indexes(cls._db.interviews)
+            except Exception as e:
+                logger.error(f"Failed to connect to MongoDB: {e}", exc_info=True)
+                cls._instance = None # Prevent returning a broken instance
+                raise DatabaseError(f"Failed to connect to MongoDB: {e}")
+        return cls._instance
+
+    @classmethod
+    def _create_indexes(cls, collection):
         try:
-            collection = await self._get_collection()
-            await collection.insert_one(interview.dict())
-            
-            logger.info("Interview created", extra={
-                "interview_id": interview.id,
-                "phone_number": interview.phone_number
-            })
-            
+            collection.create_index("phone_number")
+            collection.create_index("message_id", unique=True)
+            collection.create_index([("created_at", -1)])
+            collection.create_index("status")
+            logger.info("Indexes created for interviews collection.")
+        except Exception as e:
+            logger.error(f"Error creating indexes: {e}", exc_info=True)
+
+    @property
+    def collection(self):
+        return self._db.interviews
+
+    def create_interview(self, interview: Interview) -> Interview:
+        try:
+            interview_dict = interview.model_dump(by_alias=True)
+            result = self.collection.insert_one(interview_dict)
+            interview.id = str(result.inserted_id)
+            logger.info(f"Interview created with ID: {interview.id}")
             return interview
-            
         except Exception as e:
-            logger.error("Failed to create interview", extra={
-                "error": str(e),
-                "interview_id": interview.id
-            })
-            raise DatabaseError(f"Failed to create interview: {str(e)}")
-    
-    async def get_by_id(self, interview_id: str) -> Optional[Interview]:
+            logger.error(f"Failed to create interview: {e}", exc_info=True)
+            raise DatabaseError(f"Failed to create interview: {e}")
+
+    def get_interview_by_id(self, interview_id: str) -> Optional[Interview]:
         try:
-            collection = await self._get_collection()
-            data = await collection.find_one({"id": interview_id})
-            return Interview(**data) if data else None
-            
-        except Exception as e:
-            logger.error("Failed to get interview by ID", extra={
-                "error": str(e),
-                "interview_id": interview_id
-            })
+            document = self.collection.find_one({"_id": ObjectId(interview_id)})
+            if document:
+                return Interview(**document)
             return None
-    
-    async def get_by_message_id(self, message_id: str) -> Optional[Interview]:
-        try:
-            collection = await self._get_collection()
-            data = await collection.find_one({"message_id": message_id})
-            return Interview(**data) if data else None
-            
         except Exception as e:
-            logger.error("Failed to get interview by message ID", extra={
-                "error": str(e),
-                "message_id": message_id
-            })
+            logger.error(f"Failed to get interview by ID {interview_id}: {e}", exc_info=True)
             return None
-    
-    async def update(self, interview: Interview) -> Interview:
+
+    def update_interview(self, interview_id: str, update_data: Dict[str, Any]) -> bool:
         try:
-            collection = await self._get_collection()
-            result = await collection.update_one(
-                {"id": interview.id},
-                {"$set": interview.dict()}
+            result = self.collection.update_one(
+                {"_id": ObjectId(interview_id)},
+                {"$set": update_data}
             )
-            
             if result.matched_count == 0:
-                raise DatabaseError(f"Interview not found: {interview.id}")
-            
-            logger.info("Interview updated", extra={
-                "interview_id": interview.id,
-                "status": interview.status
-            })
-            
-            return interview
-            
+                logger.warning(f"Interview not found for update: {interview_id}")
+                return False
+            logger.info(f"Interview {interview_id} updated successfully.")
+            return True
         except Exception as e:
-            logger.error("Failed to update interview", extra={
-                "error": str(e),
-                "interview_id": interview.id
-            })
-            raise DatabaseError(f"Failed to update interview: {str(e)}")
-    
-    async def get_recent_by_phone(
-        self, 
-        phone_number: str, 
-        limit: int = 10
-    ) -> List[Interview]:
+            logger.error(f"Failed to update interview {interview_id}: {e}", exc_info=True)
+            return False
+
+    def get_by_message_id(self, message_id: str) -> Optional[Interview]:
         try:
-            collection = await self._get_collection()
-            cursor = collection.find(
-                {"phone_number": phone_number}
-            ).sort("created_at", -1).limit(limit)
-            
-            interviews = []
-            async for doc in cursor:
-                interviews.append(Interview(**doc))
-            
-            return interviews
-            
+            document = self.collection.find_one({"message_id": message_id})
+            if document:
+                return Interview(**document)
+            return None
         except Exception as e:
-            logger.error("Failed to get recent interviews", extra={
-                "error": str(e),
-                "phone_number": phone_number
-            })
-            return []
-    
-    async def get_processing_count(self) -> int:
-        try:
-            collection = await self._get_collection()
-            return await collection.count_documents({
-                "status": {"$in": [
-                    InterviewStatus.PROCESSING,
-                    InterviewStatus.TRANSCRIBING,
-                    InterviewStatus.ANALYZING
-                ]}
-            })
-            
-        except Exception as e:
-            logger.error("Failed to get processing count", extra={
-                "error": str(e)
-            })
-            return 0
+            logger.error(f"Failed to get interview by message_id {message_id}: {e}", exc_info=True)
+            return None

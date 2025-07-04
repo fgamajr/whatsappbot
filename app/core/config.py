@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str
     GEMINI_API_KEY: str
     WHISPER_MODEL: str = "whisper-1"
+    OPENAI_MODEL: str = "gpt-4o"
+    GEMINI_MODEL: str = "models/gemini-1.5-pro"
     
     # Database
     MONGODB_URL: str

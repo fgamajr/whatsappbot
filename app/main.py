@@ -49,9 +49,26 @@ async def lifespan(app: FastAPI):
         # Start auto-scaler
         asyncio.create_task(auto_scaler.start_auto_scaling())
         
-        logger.info("Monitoring services started successfully")
+        # Initialize circuit breakers for external services
+        from app.infrastructure.patterns.circuit_breaker import (
+            get_openai_circuit_breaker, get_gemini_circuit_breaker, get_whatsapp_circuit_breaker
+        )
+        get_openai_circuit_breaker()
+        get_gemini_circuit_breaker() 
+        get_whatsapp_circuit_breaker()
+        
+        # Initialize secrets manager
+        from app.infrastructure.security.secrets_manager import secrets_manager
+        secrets_health = await secrets_manager.health_check()
+        logger.info(f"Secrets manager initialized: {secrets_health}")
+        
+        # Initialize business metrics collection
+        from app.infrastructure.monitoring.business_metrics import business_metrics
+        await business_metrics.record_metric("system_startup", 1.0, {"component": "main"})
+        
+        logger.info("All monitoring and security services started successfully")
     except Exception as e:
-        logger.warning(f"Failed to start monitoring services: {e}")
+        logger.warning(f"Failed to start services: {e}")
     
     yield
     
@@ -87,6 +104,10 @@ if settings.DEBUG:
 # Monitoring endpoints
 from app.api.endpoints import monitoring
 app.include_router(monitoring.router, tags=["monitoring"])
+
+# Export endpoints
+from app.api.endpoints import export
+app.include_router(export.router, tags=["export"])
 
 
 # Recovery routes
