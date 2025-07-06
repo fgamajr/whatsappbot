@@ -4,6 +4,8 @@
 .env.production
 .env.staging
 .claude
+.github
+
 
 # Python
 __pycache__/
