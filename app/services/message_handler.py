@@ -1,6 +1,7 @@
 from typing import Dict, Any
 import logging
 import os
+import asyncio
 from app.domain.entities.interview import Interview, InterviewStatus
 from app.infrastructure.database.repositories.interview import InterviewRepository
 from app.infrastructure.messaging.base import MessagingProvider
@@ -9,6 +10,9 @@ from app.services.audio_processor import AudioProcessor
 from app.services.transcription import TranscriptionService
 from app.services.analysis import AnalysisService
 from app.services.document_generator import DocumentGenerator
+from app.services.prompt_manager import PromptManagerService
+from app.services.user_session_manager import UserSessionManager
+from app.utils.progress_tracker import ProgressTracker, TimeEstimator
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -22,6 +26,8 @@ class MessageHandler:
         self.transcription = TranscriptionService()
         self.analysis = AnalysisService()
         self.doc_generator = DocumentGenerator()
+        self.prompt_manager = PromptManagerService()
+        self.session_manager = UserSessionManager()
 
     # ---> INÍCIO DA MODIFICAÇÃO 1: Função auxiliar <---
     def _get_file_id_from_message(self, message_obj: Dict[str, Any]) -> str:
@@ -56,6 +62,45 @@ class MessageHandler:
                 message_id=message_data["message_id"],
                 audio_id=audio_id_str
             )
+            
+            # 4. Verificar se o usuário tem uma preferência de prompt recente ou sessão ativa
+            try:
+                # First check if user has custom instructions waiting
+                if await self.session_manager.is_waiting_for_audio(message_data["from"]):
+                    session = await self.session_manager.session_repo.get_session(message_data["from"])
+                    if session:
+                        custom_prompt_id = session.get_context_value("custom_prompt_id")
+                        custom_instructions = session.get_context_value("custom_instructions")
+                        
+                        if custom_prompt_id and custom_instructions:
+                            interview.set_selected_prompt(custom_prompt_id)
+                            # Store custom instructions in interview context
+                            interview.custom_instructions = custom_instructions
+                            
+                            logger.info("Applied user's custom prompt with instructions", extra={
+                                "user_id": message_data["from"],
+                                "prompt_id": custom_prompt_id,
+                                "instructions_length": len(custom_instructions)
+                            })
+                            
+                            # Clear session after applying
+                            await self.session_manager.clear_session(message_data["from"])
+                        
+                else:
+                    # Regular preference check
+                    user_pref = await self.prompt_manager.prompt_repo.get_user_preference(message_data["from"])
+                    if user_pref and user_pref.last_selected_prompt_id:
+                        interview.set_selected_prompt(user_pref.last_selected_prompt_id)
+                        logger.info("Applied user's last selected prompt", extra={
+                            "user_id": message_data["from"],
+                            "prompt_id": user_pref.last_selected_prompt_id
+                        })
+                        
+            except Exception as e:
+                logger.warning("Failed to get user prompt preference", extra={
+                    "error": str(e),
+                    "user_id": message_data["from"]
+                })
             
             # ---> FIM DA MODIFICAÇÃO 2 <---
             
@@ -102,40 +147,60 @@ class MessageHandler:
                 )
                 print(f"🚨 Mensagem de erro enviada")
     
-    # ---> INÍCIO DA MODIFICAÇÃO 3: Assinatura e chamada de download <---
     async def _process_audio(self, interview: Interview, media_payload: Any):
-        """Internal audio processing logic"""
-        await self.messaging_provider.send_text_message(
-            interview.phone_number,
-            "🎵 Baixando áudio..."
-        )
+        """Internal audio processing logic with progress tracking"""
+        # Create progress tracker
+        progress_tracker = ProgressTracker(self.messaging_provider, interview.phone_number)
         
-        # 5. Usamos o media_payload (objeto completo) para o download.
+        # Download audio
+        await progress_tracker.send_progress_message("🎵 Baixando áudio...", force=True)
         audio_bytes = await self.messaging_provider.download_media(media_payload)
-        # ---> FIM DA MODIFICAÇÃO 3 <---
-
+        
         if not audio_bytes:
             raise Exception("Failed to download audio")
         
         interview.audio_size_mb = len(audio_bytes) / (1024 * 1024)
         
-        # ... (O resto do seu código robusto é preservado sem alterações) ...
-        await self.messaging_provider.send_text_message(
-            interview.phone_number,
-            f"🔄 Convertendo e dividindo áudio ({interview.audio_size_mb:.1f}MB)\n📝 Transcrição com timestamps"
+        # Estimate audio duration (rough estimate: 1MB ≈ 1 minute for typical voice)
+        estimated_duration = interview.audio_size_mb * 1.2  # conservative estimate
+        
+        # Get time estimates
+        time_estimates = TimeEstimator.estimate_total_processing_time(
+            interview.audio_size_mb, 
+            estimated_duration
         )
         
-        mp3_bytes = self.audio_processor.convert_to_mp3(audio_bytes)
-        chunks = self.audio_processor.split_into_chunks(mp3_bytes)
+        # Send concise initial estimate to user
+        if time_estimates['total_minutes'] > 3:
+            estimate_msg = (
+                f"📊 Áudio: {interview.audio_size_mb:.1f}MB\n"
+                f"⏱️ Estimado: ~{time_estimates['total_minutes']:.1f}min\n"
+                f"🔄 {time_estimates['num_chunks']} chunks para processar"
+            )
+            await progress_tracker.send_progress_message(estimate_msg, force=True)
         
+        # Audio conversion (no heartbeat for fast operations)
+        await progress_tracker.send_progress_message("🔄 Convertendo áudio...", force=True)
+        mp3_bytes = self.audio_processor.convert_to_mp3(audio_bytes)
+        
+        # Split into chunks
+        chunks = self.audio_processor.split_into_chunks(mp3_bytes)
         interview.chunks_total = len(chunks)
         await self.interview_repo.update(interview)
         
+        # Update status
         interview.status = InterviewStatus.TRANSCRIBING
         await self.interview_repo.update(interview)
         
+        # Simple transcription start message
+        if len(chunks) > 1:
+            await progress_tracker.send_progress_message(
+                f"🎙️ Iniciando transcrição ({len(chunks)} chunks)",
+                force=True
+            )
+        
         transcript = await self.transcription.transcribe_chunks(
-            chunks, interview, self._update_progress
+            chunks, interview, self._update_progress_enhanced
         )
         
         if not transcript:
@@ -143,40 +208,79 @@ class MessageHandler:
         
         interview.transcript = transcript
         
+        # Analysis with minimal tracking
         interview.status = InterviewStatus.ANALYZING
         await self.interview_repo.update(interview)
         
-        await self.messaging_provider.send_text_message(
-            interview.phone_number,
-            "🧠 Gerando análise estruturada..."
-        )
+        # Only use heartbeat for longer analysis
+        if time_estimates['analysis_minutes'] > 2:
+            async def generate_analysis():
+                return await self.analysis.generate_report(
+                    transcript, 
+                    user_id=interview.phone_number,
+                    prompt_identifier=interview.selected_prompt_id,
+                    custom_instructions=getattr(interview, 'custom_instructions', None)
+                )
+            
+            analysis = await progress_tracker.run_with_heartbeat(
+                generate_analysis,
+                "Gerando análise com IA",
+                time_estimates['analysis_minutes']
+            )
+        else:
+            await progress_tracker.send_progress_message("🧠 Gerando análise...", force=True)
+            analysis = await self.analysis.generate_report(
+                transcript, 
+                user_id=interview.phone_number,
+                prompt_identifier=interview.selected_prompt_id,
+                custom_instructions=getattr(interview, 'custom_instructions', None)
+            )
         
-        analysis = await self.analysis.generate_report(transcript)
         if analysis:
             interview.analysis = analysis
         
+        # Document generation (no heartbeat for fast operation)
         await self._create_and_send_documents(interview)
         
+        # Final completion
         interview.mark_completed()
         await self.interview_repo.update(interview)
         
-        await self.messaging_provider.send_text_message(
-            interview.phone_number,
-            f"🎉 Processamento completo! (ID: {interview.id[:8]})\n\n"
-            f"📝 Transcrição: Com timestamps precisos\n"
-            f"📄 {2 if analysis else 1} documento(s) enviado(s)\n"
-            f"⏱️ Processamento em background concluído!"
+        await progress_tracker.send_progress_message(
+            f"🎉 Processamento completo!\n"
+            f"📄 {2 if analysis else 1} documento(s) enviado(s)",
+            force=True
         )
     
-    async def _update_progress(self, interview: Interview, chunk_num: int):
-        """Update processing progress"""
+    async def _update_progress_enhanced(self, interview: Interview, chunk_num: int):
+        """Enhanced progress update with time estimates"""
         interview.chunks_processed = chunk_num
         await self.interview_repo.update(interview)
         
-        await self.messaging_provider.send_text_message(
-            interview.phone_number,
-            f"🎙️ Transcrevendo chunk {chunk_num}/{interview.chunks_total}"
-        )
+        # Only send progress for the START of each chunk, not completion
+        # This prevents the 100% issue
+        if chunk_num <= interview.chunks_total:
+            # Calculate progress for chunks STARTED (not completed)
+            progress_percent = ((chunk_num - 1) / interview.chunks_total) * 100
+            remaining_chunks = interview.chunks_total - chunk_num + 1
+            
+            # Simple message - no spam
+            progress_msg = f"🎙️ Processando chunk {chunk_num}/{interview.chunks_total}"
+            
+            # Only add timing for longer processes
+            if interview.chunks_total > 2 and remaining_chunks > 0:
+                estimated_remaining_minutes = remaining_chunks * 2.5
+                if estimated_remaining_minutes > 1:
+                    progress_msg += f" (~{estimated_remaining_minutes:.1f}min restantes)"
+            
+            await self.messaging_provider.send_text_message(
+                interview.phone_number,
+                progress_msg
+            )
+    
+    async def _update_progress(self, interview: Interview, chunk_num: int):
+        """Legacy progress update method for compatibility"""
+        await self._update_progress_enhanced(interview, chunk_num)
     
     async def _handle_large_audio_error(self, interview: Interview, error_message: str):
         """Handle large audio files with helpful guidance"""
@@ -217,12 +321,13 @@ class MessageHandler:
         await self.interview_repo.update(interview)
 
     async def _create_and_send_documents(self, interview: Interview):
-        """Create and send documents"""
+        """Create and send documents with minimal progress updates"""
         await self.messaging_provider.send_text_message(
             interview.phone_number,
             "📄 Criando documentos..."
         )
         
+        # Generate documents
         transcript_path, analysis_path = self.doc_generator.create_documents(
             interview.transcript,
             interview.analysis or "Análise não disponível",
@@ -230,6 +335,7 @@ class MessageHandler:
         )
         
         try:
+            # Upload and send transcript (no separate message)
             transcript_media_id = await self.messaging_provider.upload_media(transcript_path)
             if transcript_media_id:
                 await self.messaging_provider.send_document(
@@ -239,6 +345,7 @@ class MessageHandler:
                     f"transcricao_{interview.id[:8]}.docx"
                 )
             
+            # Upload and send analysis if available (no separate message)
             if interview.analysis and analysis_path:
                 analysis_media_id = await self.messaging_provider.upload_media(analysis_path)
                 if analysis_media_id:
@@ -249,6 +356,7 @@ class MessageHandler:
                         f"analise_{interview.id[:8]}.docx"
                     )
         finally:
+            # Clean up temporary files
             for path in [transcript_path, analysis_path]:
                 try:
                     if path and os.path.exists(path):

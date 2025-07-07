@@ -26,6 +26,10 @@ class Interview(BaseModel):
     audio_size_mb: float = 0.0
     duration_minutes: Optional[float] = None
     
+    # Analysis preferences
+    selected_prompt_id: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    
     # Processing info
     chunks_total: int = 0
     chunks_processed: int = 0
@@ -60,3 +64,7 @@ class Interview(BaseModel):
         self.status = InterviewStatus.FAILED
         self.error = error
         self.completed_at = datetime.now()
+    
+    def set_selected_prompt(self, prompt_id: str):
+        """Set the selected prompt for analysis"""
+        self.selected_prompt_id = prompt_id

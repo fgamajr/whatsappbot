@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 class GeminiService:
     def __init__(self):
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('models/gemini-1.5-pro')
+        self.model = genai.GenerativeModel(f'models/{settings.GEMINI_MODEL}')
         
     async def generate_analysis(self, transcript: str, prompt: str) -> Optional[str]:
         """Generate analysis using Gemini"""

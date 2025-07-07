@@ -4,6 +4,7 @@ import logging
 
 from app.api.v1 import webhooks, health, messaging
 from app.api.middleware.error_handler import ErrorHandlerMiddleware
+from app.api.middleware.security_filter import SecurityFilterMiddleware
 from app.core.config import settings
 from app.core.logging import setup_logging
 from app.infrastructure.database.mongodb import MongoDB
@@ -37,6 +38,8 @@ app = FastAPI(
 )
 
 # Middleware
+if settings.DEBUG:
+    app.add_middleware(SecurityFilterMiddleware)  # Filter suspicious requests in dev
 app.add_middleware(ErrorHandlerMiddleware)
 
 # Routes
@@ -72,9 +75,11 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+    # Use localhost only for development to avoid external requests
+    host = "127.0.0.1" if settings.DEBUG else "0.0.0.0"
     uvicorn.run(
         "app.main:app",
-        host="0.0.0.0",
+        host=host,
         port=8000,
         reload=settings.DEBUG
     )
