@@ -1,0 +1,5 @@
+platform,identifier,name,role,daily_limit,monthly_limit,expires_days,features
+whatsapp,5511999999999,Admin User,admin,100,3000,,audio_analysis,text_commands,admin_commands,user_management
+whatsapp,5511888888888,John Doe,user,50,1000,365,audio_analysis,text_commands
+telegram,123456789,Jane Smith,user,30,800,180,audio_analysis,text_commands
+whatsapp,5511777777777,Test User,limited,10,200,30,text_commands

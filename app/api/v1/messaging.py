@@ -4,6 +4,7 @@ import logging
 from app.services.message_handler import MessageHandler
 from app.services.prompt_manager import PromptManagerService
 from app.services.user_session_manager import UserSessionManager
+from app.services.authorization import authorization_service
 from app.domain.entities.prompt import PromptCategory
 from app.infrastructure.messaging.factory import MessagingProviderFactory
 from app.core.config import settings
@@ -57,6 +58,74 @@ async def _handle_webhook(request: Request, background_tasks: BackgroundTasks, p
         standard_message = provider.extract_message_data(data)
         if not standard_message:
             return Response(status_code=200)
+        
+        # Check user authorization
+        is_authorized, user, reason = await authorization_service.check_user_authorization(
+            provider_name, standard_message.from_number
+        )
+        
+        if not is_authorized:
+            logger.warning("Unauthorized access attempt", extra={
+                "provider": provider_name,
+                "from_number": standard_message.from_number,
+                "reason": reason
+            })
+            
+            # Send appropriate message based on the reason
+            if reason == "User not authorized":
+                unauthorized_message = (
+                    "🚫 **Acesso Não Autorizado**\n\n"
+                    "Este bot está restrito a usuários autorizados.\n"
+                    "Para solicitar acesso, entre em contato:\n\n"
+                    f"{settings.ADMIN_CONTACT_INFO}\n\n"
+                    f"🆔 **Seu ID:** `{standard_message.from_number}`\n"
+                    "ℹ️ Informe este ID e o motivo do acesso."
+                )
+            elif "limit exceeded" in reason.lower():
+                unauthorized_message = (
+                    "⚠️ **Limite de Uso Excedido**\n\n"
+                    "Você atingiu o limite de mensagens permitidas.\n"
+                    "Para aumentar seu limite, entre em contato:\n\n"
+                    f"{settings.ADMIN_CONTACT_INFO}\n\n"
+                    f"📊 Status: {reason}"
+                )
+            elif "suspended" in reason.lower():
+                unauthorized_message = (
+                    "⛔ **Conta Suspensa**\n\n"
+                    "Sua conta foi suspensa temporariamente.\n"
+                    "Para mais informações, entre em contato:\n\n"
+                    f"{settings.ADMIN_CONTACT_INFO}"
+                )
+            elif "expired" in reason.lower():
+                unauthorized_message = (
+                    "⏰ **Acesso Expirado**\n\n"
+                    "Seu acesso ao bot expirou.\n"
+                    "Para renovar seu acesso, entre em contato:\n\n"
+                    f"{settings.ADMIN_CONTACT_INFO}"
+                )
+            else:
+                unauthorized_message = (
+                    "❌ **Acesso Negado**\n\n"
+                    "Não foi possível processar sua solicitação.\n"
+                    "Entre em contato:\n\n"
+                    f"{settings.ADMIN_CONTACT_INFO}\n\n"
+                    f"ℹ️ Detalhes: {reason}"
+                )
+            
+            # Send unauthorized message
+            try:
+                await provider.send_text_message(standard_message.from_number, unauthorized_message)
+            except Exception as send_error:
+                logger.error("Failed to send unauthorized message", extra={
+                    "error": str(send_error),
+                    "provider": provider_name,
+                    "from_number": standard_message.from_number
+                })
+            
+            return Response(status_code=200)
+        
+        # Record message usage for authorized user
+        await authorization_service.record_message_usage(provider_name, standard_message.from_number)
         
         # Check for duplicates
         message_id = standard_message.message_id
@@ -162,6 +231,7 @@ async def _handle_text_message(message_data: Dict, provider):
 • `prompts` - Ver tipos de análise disponíveis
 • `status` - Informações do sistema
 • `padrão` - Usar análise mais popular
+• `id` - Ver seu ID para solicitar acesso
         """
         await provider.send_text_message(from_number, help_message)
     
@@ -199,6 +269,17 @@ async def _handle_text_message(message_data: Dict, provider):
 📝 **Tipos de Análise:** Digite `prompts` para ver opções
         """
         await provider.send_text_message(from_number, status_message)
+    
+    elif text in ["id", "myid", "meu id", "chat id", "chatid"]:
+        id_message = f"""
+🆔 **Suas Informações de Identificação**
+
+📱 **Seu ID:** `{from_number}`
+🤖 **Plataforma:** {provider_name.title()}
+
+ℹ️ Use este ID para solicitar acesso ao administrador.
+        """
+        await provider.send_text_message(from_number, id_message)
     
     elif text.isdigit() or text in ["entrevista", "resumo", "tecnico", "técnico", "cultura", "custom"]:
         # User is selecting a prompt

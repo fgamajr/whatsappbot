@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = 10
     RATE_LIMIT_PER_HOUR: int = 100
+    
+    # Authorization & Support
+    ADMIN_CONTACT_INFO: str = "📧 Envie um email para: suporte@empresa.com\n📱 WhatsApp: +55 11 99999-9999"
 
 
 @lru_cache()
