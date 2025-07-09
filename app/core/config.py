@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     
     # Authorization & Support
     ADMIN_CONTACT_INFO: str = "📧 Envie um email para: suporte@empresa.com\n📱 WhatsApp: +55 11 99999-9999"
+    
+    # YouTube Download Settings
+    YOUTUBE_MAX_DURATION: int = 7200  # 2 hours in seconds
+    YOUTUBE_MAX_FILE_SIZE: int = 200 * 1024 * 1024  # 200MB in bytes
+    YOUTUBE_DOWNLOAD_TIMEOUT: int = 300  # 5 minutes timeout
+    YOUTUBE_QUALITY: str = "160+140/133+140/134+140/worst"  # Specific format combos that work
+    
+    # yt-dlp service settings
+    YTDLP_SERVICE_URL: str = "http://localhost:8080"
+    YTDLP_AUTO_UPDATE: bool = True
+    YTDLP_UPDATE_INTERVAL_HOURS: int = 6
 
 
 @lru_cache()

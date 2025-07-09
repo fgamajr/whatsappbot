@@ -28,8 +28,18 @@ class MessagingProvider(ABC):
         pass
     
     @abstractmethod
-    async def send_document(self, to: str, media_id: str, caption: str, filename: str) -> bool:
-        """Send a document message"""
+    async def edit_message(self, to: str, message_id: int, new_text: str) -> bool:
+        """Edit an existing text message"""
+        pass
+    
+    @abstractmethod
+    async def send_video_message(self, to: str, video_data: bytes, filename: str) -> bool:
+        """Send a video message"""
+        pass
+    
+    @abstractmethod
+    async def send_audio_message(self, to: str, audio_data: bytes, filename: str) -> bool:
+        """Send an audio message"""
         pass
     
     @abstractmethod
@@ -40,6 +50,11 @@ class MessagingProvider(ABC):
     @abstractmethod
     def validate_webhook(self, request_data: Dict[str, Any], query_params: Dict[str, str]) -> bool:
         """Validate webhook request"""
+        pass
+    
+    @abstractmethod
+    def get_provider_name(self) -> str:
+        """Get the provider name"""
         pass
 
 

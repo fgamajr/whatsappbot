@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  yt-dlp-service:
+    build:
+      context: ./docker/yt-dlp
+      dockerfile: Dockerfile
+    container_name: yt-dlp-service
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - /tmp:/tmp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+    # Auto-update cron job
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+      
+  # Optional: Watchtower for auto-updates
+  watchtower:
+    image: containrrr/watchtower
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=3600  # Check every hour
+      - WATCHTOWER_LABEL_ENABLE=true
+    restart: unless-stopped

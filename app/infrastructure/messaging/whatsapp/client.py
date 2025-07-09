@@ -1,5 +1,6 @@
 import aiohttp
 import os
+import tempfile
 from typing import Optional, Dict, Any
 import logging
 import traceback
@@ -17,6 +18,10 @@ class WhatsAppProvider(MessagingProvider):
         self.phone_number_id = settings.PHONE_NUMBER_ID
         self.api_version = settings.WHATSAPP_API_VERSION
         self.base_url = f"https://graph.facebook.com/{self.api_version}"
+    
+    def get_provider_name(self) -> str:
+        """Get the provider name"""
+        return "whatsapp"
         
     async def send_text_message(self, to: str, message: str) -> bool:
         """Send text message via WhatsApp"""
@@ -265,6 +270,112 @@ class WhatsAppProvider(MessagingProvider):
                 "error": str(e),
                 "to_number": to,
                 "media_id": media_id
+            })
+            return False
+    
+    async def send_video_message(self, to: str, video_data: bytes, filename: str) -> bool:
+        """Send a video message via WhatsApp"""
+        try:
+            # Create temporary file for video
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
+                temp_file.write(video_data)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Upload the video
+                media_id = await self.upload_media(temp_file_path)
+                if not media_id:
+                    logger.error("Failed to upload video", extra={
+                        "to_number": to,
+                        "filename": filename,
+                        "size_bytes": len(video_data)
+                    })
+                    return False
+                
+                # Send as document with video MIME type
+                success = await self.send_document(
+                    to=to,
+                    media_id=media_id,
+                    caption=f"📹 {filename}",
+                    filename=filename
+                )
+                
+                logger.info("Video message sent", extra={
+                    "to_number": to,
+                    "filename": filename,
+                    "size_bytes": len(video_data),
+                    "media_id": media_id,
+                    "success": success
+                })
+                
+                return success
+                
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            logger.error("Error sending video message", extra={
+                "error": str(e),
+                "to_number": to,
+                "filename": filename,
+                "size_bytes": len(video_data)
+            })
+            return False
+    
+    async def send_audio_message(self, to: str, audio_data: bytes, filename: str) -> bool:
+        """Send an audio message via WhatsApp"""
+        try:
+            # Create temporary file for audio
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Upload the audio
+                media_id = await self.upload_media(temp_file_path)
+                if not media_id:
+                    logger.error("Failed to upload audio", extra={
+                        "to_number": to,
+                        "filename": filename,
+                        "size_bytes": len(audio_data)
+                    })
+                    return False
+                
+                # Send as document with audio MIME type
+                success = await self.send_document(
+                    to=to,
+                    media_id=media_id,
+                    caption=f"🎵 {filename}",
+                    filename=filename
+                )
+                
+                logger.info("Audio message sent", extra={
+                    "to_number": to,
+                    "filename": filename,
+                    "size_bytes": len(audio_data),
+                    "media_id": media_id,
+                    "success": success
+                })
+                
+                return success
+                
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            logger.error("Error sending audio message", extra={
+                "error": str(e),
+                "to_number": to,
+                "filename": filename,
+                "size_bytes": len(audio_data)
             })
             return False
 

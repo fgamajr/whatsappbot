@@ -1,0 +1,67 @@
+Assunto: 🚨 Ajuda com Sistema YouTube - Problema yt-dlp Fallbacks
+
+Olá [Nome do Colega],
+
+Estou com um problema técnico específico no meu bot de WhatsApp/Telegram e preciso de uma segunda opinião. 
+
+## 🎯 RESUMO DO PROBLEMA
+
+Implementei um sistema para baixar vídeos do YouTube usando yt-dlp, mas estou enfrentando uma inconsistência estranha:
+
+- ✅ **Testes isolados**: Funcionam perfeitamente (sistema de fallback pega e baixa áudio)
+- ❌ **Aplicação integrada**: Fallbacks falham mesmo com configuração idêntica
+
+**Erro específico:**
+```
+ERROR: [youtube] b7MZ8EUKKDw: Requested format is not available. Use --list-formats for a list of available formats
+```
+
+## 📦 ARQUIVOS EM ANEXO
+
+Preparei um ZIP com todos os arquivos relevantes:
+**`youtube_system_problem.zip` (31KB)**
+
+**Arquivos mais críticos para revisar:**
+1. `youtube_downloader.py` - Lógica principal de download com fallbacks
+2. `messaging.py` - Integração com sistema de mensagens  
+3. `README.md` - Explicação detalhada do problema
+
+## 🔍 SUSPEITAS
+
+1. **Concorrência**: Problemas com múltiplas chamadas simultâneas
+2. **Contexto assíncrono**: Issues com asyncio + thread pool executor
+3. **Arquivos temporários**: Conflitos entre sessões
+4. **Configuração yt-dlp**: Alguma opção inadequada para produção
+
+## 🧪 PARA REPRODUZIR
+
+**URL de teste problemática:**
+`https://youtube.com/watch?v=b7MZ8EUKKDw`
+
+**Dependências:**
+```bash
+pip install yt-dlp==2024.12.3 ffmpeg-python==0.2.0
+sudo apt install ffmpeg
+```
+
+**Comportamento esperado:** Formato principal falha → Fallback para áudio → Sucesso
+**Comportamento real:** Formato principal falha → Fallbacks também falham
+
+## 🙏 O QUE PRECISO
+
+- Identificar por que os fallbacks funcionam isoladamente mas falham na integração
+- Sugestões de configurações mais robustas do yt-dlp
+- Ou abordagem alternativa para o problema
+
+O sistema está 90% funcional - só falta resolver esta inconsistência específica.
+
+Você poderia dar uma olhada quando tiver tempo? Qualquer insight seria muito valioso!
+
+Muito obrigado!
+
+Abraços,
+[Seu Nome]
+
+---
+
+P.S.: O README.md dentro do ZIP tem uma explicação mais detalhada com suspeitas específicas e logs de exemplo.

@@ -8,6 +8,8 @@ class SessionState(str, Enum):
     IDLE = "idle"
     WAITING_CUSTOM_INSTRUCTIONS = "waiting_custom_instructions"
     WAITING_AUDIO = "waiting_audio"
+    WAITING_YOUTUBE_CONFIRMATION = "waiting_youtube_confirmation"
+    BUSY = "busy"
 
 
 class UserSession(BaseModel):

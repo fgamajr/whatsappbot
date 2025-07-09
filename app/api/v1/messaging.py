@@ -1,10 +1,14 @@
 from fastapi import APIRouter, Request, Response, BackgroundTasks
 from typing import Dict, Set
 import logging
+import time
+from datetime import datetime
 from app.services.message_handler import MessageHandler
 from app.services.prompt_manager import PromptManagerService
 from app.services.user_session_manager import UserSessionManager
 from app.services.authorization import authorization_service
+from app.services.youtube_downloader import youtube_service, YouTubeDownloadError
+from app.utils.youtube_detector import detect_youtube_urls
 from app.domain.entities.prompt import PromptCategory
 from app.infrastructure.messaging.factory import MessagingProviderFactory
 from app.core.config import settings
@@ -169,7 +173,7 @@ async def _handle_webhook(request: Request, background_tasks: BackgroundTasks, p
         
         elif standard_message.message_type.value == "text":
             # Handle text commands immediately
-            await _handle_text_message(message_data, provider)
+            await _handle_text_message(message_data, provider, background_tasks)
         
         return Response(status_code=200)
         
@@ -181,7 +185,7 @@ async def _handle_webhook(request: Request, background_tasks: BackgroundTasks, p
         return Response(status_code=500)
 
 
-async def _handle_text_message(message_data: Dict, provider):
+async def _handle_text_message(message_data: Dict, provider, background_tasks: BackgroundTasks):
     """Handle text commands immediately"""
     from_number = message_data["from"]
     text = message_data["content"].strip()  # Don't lowercase for custom instructions
@@ -205,6 +209,106 @@ async def _handle_text_message(message_data: Dict, provider):
             )
         return
     
+    # Check if user is waiting for YouTube confirmation
+    if await session_manager.is_waiting_for_youtube_confirmation(from_number):
+        # User is responding to YouTube processing confirmation
+        response_lower = text.lower().strip()
+        
+        confirmed = False
+        if response_lower in ["sim", "s", "yes", "y", "ok", "processar", "continuar", "👍", "✅"]:
+            confirmed = True
+        elif response_lower in ["não", "nao", "n", "no", "cancelar", "parar", "👎", "❌"]:
+            confirmed = False
+        else:
+            # Invalid response
+            await provider.send_text_message(
+                from_number,
+                "❓ **Resposta não reconhecida**\n\n"
+                "Por favor, responda:\n"
+                "• `Sim` ou `S` - Para processar o vídeo\n"
+                "• `Não` ou `N` - Para cancelar\n\n"
+                "🎬 O vídeo baixado está aguardando sua decisão."
+            )
+            return
+        
+        # Process confirmation
+        success, result = await session_manager.process_youtube_confirmation(from_number, confirmed)
+        
+        if success:
+            if result.get("declined"):
+                await provider.send_text_message(
+                    from_number,
+                    "❌ **Processamento cancelado**\n\n"
+                    "O vídeo não será processado. Você pode enviar outro link do YouTube quando quiser!\n\n"
+                    "💡 Dica: Envie `help` para ver outras opções."
+                )
+            else:
+                # User confirmed, process the video
+                video_data = result.get("video_data")
+                metadata = result.get("metadata", {})
+                
+                if video_data:
+                    await provider.send_text_message(
+                        from_number,
+                        "🚀 **Processamento iniciado!**\n\n"
+                        f"🎬 Vídeo: {metadata.get('title', 'Video do YouTube')}\n"
+                        "⚡ Iniciando transcrição e análise...\n"
+                        "📱 Você receberá updates regulares!"
+                    )
+                    
+                    # Create a mock message data structure for processing
+                    # We need to simulate the structure that process_audio_message expects
+                    mock_message_data = {
+                        "from": from_number,
+                        "type": "audio",  # Changed to audio for existing processor
+                        "message_id": f"youtube_{metadata.get('video_id', 'unknown')}_{int(datetime.now().timestamp())}",
+                        "timestamp": datetime.now().isoformat(),
+                        "media_id": {
+                            # Create a mock media payload that contains the video data directly
+                            "video_data": video_data,
+                            "metadata": metadata,
+                            "source": "youtube"
+                        }
+                    }
+                    
+                    # Schedule background processing  
+                    handler = MessageHandler(provider)
+                    background_tasks.add_task(handler.process_audio_message, mock_message_data)
+                    
+                    logger.info("YouTube video processing scheduled", extra={
+                        "from_number": from_number,
+                        "video_title": metadata.get('title'),
+                        "video_id": metadata.get('video_id'),
+                        "file_size": len(video_data)
+                    })
+                else:
+                    await provider.send_text_message(
+                        from_number,
+                        "❌ **Erro interno**\n\n"
+                        "Não foi possível acessar os dados do vídeo. Tente enviar o link novamente."
+                    )
+        else:
+            await provider.send_text_message(
+                from_number,
+                "❌ **Erro no processamento**\n\n"
+                "Ocorreu um erro ao processar sua resposta. Tente enviar o link do YouTube novamente."
+            )
+        return
+    
+    # Check for YouTube URLs before regular command processing
+    youtube_urls = detect_youtube_urls(text)
+    if youtube_urls:
+        # Acknowledge immediately and schedule background task
+        url = youtube_urls[0]
+        await provider.send_text_message(
+            from_number,
+            "🎬 **Link do YouTube detectado!**\n\n"
+            "🔄 Processamento iniciado em background.\n"
+            "📥 Você será notificado quando o download começar."
+        )
+        background_tasks.add_task(_process_youtube_link_in_background, provider, from_number, url)
+        return
+    
     # Regular command processing (with lowercase)
     text = text_lower
     
@@ -224,7 +328,14 @@ async def _handle_text_message(message_data: Dict, provider):
 
 🚀 **Como usar:**
 • Envie o áudio da entrevista (QUALQUER duração)
+• Ou envie um link do YouTube para baixar e processar
 • Escolha o tipo de análise desejada
+
+📺 **Suporte a YouTube:**
+• Cole qualquer link do YouTube
+• Vídeos até 2 horas e 25MB
+• Download automático + confirmação
+• Processamento igual aos áudios normais
 
 💡 **Comandos úteis:**
 • `help` - Esta mensagem
@@ -275,7 +386,7 @@ async def _handle_text_message(message_data: Dict, provider):
 🆔 **Suas Informações de Identificação**
 
 📱 **Seu ID:** `{from_number}`
-🤖 **Plataforma:** {provider_name.title()}
+🤖 **Plataforma:** {type(provider).__name__.replace('Provider', '').title()}
 
 ℹ️ Use este ID para solicitar acesso ao administrador.
         """
@@ -349,3 +460,110 @@ async def _handle_text_message(message_data: Dict, provider):
             "• Ou envie o áudio direto (usará análise padrão)\n\n"
             "⚡ Resposta imediata + processamento enterprise!"
         )
+
+async def _process_youtube_link_in_background(provider, from_number: str, url: str):
+    """
+    Downloads a YouTube video, sends it to the user, and asks for confirmation
+    to process it. Runs as a background task.
+    """
+    session_manager = UserSessionManager()
+    progress_message_id = None
+    last_update_time = 0
+
+    try:
+        await session_manager.set_user_busy(from_number, "Processando link do YouTube")
+
+        # Send initial message and get its ID
+        initial_message = await provider.send_text_message(from_number, "🎬 **Link do YouTube detectado!**\n\nIniciando...")
+        if initial_message and hasattr(initial_message, 'id'):
+            progress_message_id = initial_message.id
+
+        async def progress_callback(progress):
+            nonlocal last_update_time
+            current_time = time.time()
+            if current_time - last_update_time < 5:  # Update every 5 seconds
+                return
+
+            if progress['status'] == 'downloading':
+                total_bytes = progress.get('total_bytes') or progress.get('total_bytes_estimate', 0)
+                downloaded_bytes = progress.get('downloaded_bytes', 0)
+                speed = progress.get('speed', 0)
+                
+                if total_bytes > 0:
+                    percent = downloaded_bytes / total_bytes * 100
+                    speed_str = f"{speed / 1024 / 1024:.2f} MB/s" if speed else "-- MB/s"
+                    progress_text = f"📥 **Baixando...** {int(percent)}%\n" \
+                                    f"({downloaded_bytes / 1024 / 1024:.1f}MB / {total_bytes / 1024 / 1024:.1f}MB)\n" \
+                                    f"Velocidade: {speed_str}"
+                    
+                    if progress_message_id:
+                        await provider.edit_message(from_number, progress_message_id, progress_text)
+                        last_update_time = current_time
+
+        video_data, metadata = await youtube_service.download_video(url, progress_callback)
+        
+        if progress_message_id:
+            await provider.edit_message(from_number, progress_message_id, "✅ **Download concluído!**\n\nEnviando para você...")
+        else:
+            await provider.send_text_message(from_number, "✅ **Download concluído!**\n\nEnviando para você...")
+
+        # 3. Send video/audio back to user
+        file_size_str = youtube_service.format_file_size(len(video_data))
+        
+        if metadata.get('is_audio_only'):
+            success = await provider.send_audio_message(
+                from_number,
+                video_data,
+                f"audio_youtube_{metadata.get('video_id', 'unknown')}.mp3"
+            )
+        else:
+            success = await provider.send_video_message(
+                from_number,
+                video_data,
+                f"video_youtube_{metadata.get('video_id', 'unknown')}.mp4"
+            )
+        
+        # 4. Ask for processing confirmation
+        if success:
+            media_type = "áudio" if metadata.get('is_audio_only') else "vídeo"
+            confirmation_message = f"""
+✅ **{media_type.title()} baixado com sucesso!**
+
+📦 Tamanho: {file_size_str}
+
+❓ **Deseja processar este {media_type} para transcrição e análise?**
+
+• Digite `Sim` ou `S` para processar
+• Digite `Não` ou `N` para cancelar
+            """
+            # Set state to wait for confirmation, which also clears the busy state
+            await session_manager.set_waiting_for_youtube_confirmation(from_number, video_data, metadata)
+            await provider.send_text_message(from_number, confirmation_message.strip())
+        else:
+            await provider.send_text_message(
+                from_number,
+                "❌ **Erro ao enviar o arquivo**\n\n"
+                "O download foi concluído, mas não foi possível enviá-lo para você. "
+                "O arquivo pode ser muito grande para a plataforma de mensagens."
+            )
+            # Clear busy state on failure
+            await session_manager.clear_session(from_number)
+            
+    except YouTubeDownloadError as e:
+        await provider.send_text_message(from_number, str(e))
+        await session_manager.clear_session(from_number) # Clear busy state
+    except Exception as e:
+        import traceback
+        print("---!!! CAUGHT UNEXPECTED ERROR IN YOUTUBE BACKGROUND TASK !!!---")
+        traceback.print_exc()
+        print("-----------------------------------------------------------------")
+        logger.error("Error in YouTube background task", extra={
+            "error": str(e), "url": url, "traceback": traceback.format_exc()
+        })
+        await provider.send_text_message(
+            from_number,
+            "❌ **Erro inesperado no processamento do YouTube.**\n"
+            "Tente novamente mais tarde."
+        )
+    finally:
+        await session_manager.clear_session(from_number)

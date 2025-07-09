@@ -68,6 +68,14 @@ docker-compose up -d
 - **Formatos**: Conversão automática para MP3
 - **Progress**: Updates em tempo real
 
+### 🎬 **YouTube Downloading (Resilient System)**
+- **Auto-Updates**: yt-dlp mantido sempre atualizado
+- **Fault Tolerance**: Sistema resiliente a mudanças do YouTube
+- **Microservice Architecture**: Serviço isolado e escalável
+- **Progress Tracking**: Updates em tempo real do download
+- **Format Intelligence**: Seleção automática do melhor formato
+- **Size Control**: Limites configuráveis de duração e tamanho
+
 ### 🎙️ Transcrição (Whisper)
 - **Timestamps**: Precisão em milissegundos
 - **Idioma**: Português otimizado
@@ -94,16 +102,114 @@ docker-compose up -d
 | `status` | Status do sistema |
 | `/completo` | Modo com locutores |
 | `/simples` | Modo sem locutores |
+| **YouTube URLs** | Download automático + processamento |
+| `Sim`/`Não` | Confirmação de processamento de vídeo |
+
+## 🎬 Sistema Resiliente de YouTube
+
+### 🛠️ Arquitetura
+
+O sistema de download do YouTube foi projetado para ser **resiliente às mudanças constantes do YouTube**, que frequentemente altera seus métodos de assinatura e quebra ferramentas como yt-dlp.
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Main App      │    │  yt-dlp Service │    │   Auto-Updater  │
+│                 │ ──▶│                 │ ──▶│                 │
+│ Resilient Client│    │ Docker Container│    │  Cron + Health  │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+### ⚙️ Setup do Sistema YouTube
+
+```bash
+# 1. Deploy completo do sistema YouTube
+./scripts/setup-youtube.sh
+
+# 2. Verificar status
+./scripts/youtube-status.sh
+
+# 3. Atualizar manualmente (se necessário)
+./scripts/youtube-update.sh
+```
+
+### 🔄 Como Funciona
+
+1. **Detecção**: URLs do YouTube são detectadas automaticamente
+2. **Download**: Serviço isolado faz o download usando yt-dlp atualizado
+3. **Entrega**: Vídeo/áudio é enviado para o usuário
+4. **Confirmação**: Usuário confirma se quer processar
+5. **Processamento**: Transcrição + análise como áudio normal
+
+### 🛡️ Características de Resilência
+
+- **Auto-Updates**: yt-dlp atualizado a cada 6 horas
+- **Health Checks**: Verificação de saúde a cada 30 minutos
+- **Retry Logic**: 3 tentativas com backoff exponencial
+- **Isolation**: Falhas não afetam o app principal
+- **Monitoring**: Logs estruturados e alertas
+- **Fallbacks**: Múltiplas estratégias de download
+
+### 📊 Configurações YouTube
+
+```bash
+# .env - Configurações do sistema YouTube
+YTDLP_SERVICE_URL=http://localhost:8080
+YTDLP_AUTO_UPDATE=true
+YTDLP_UPDATE_INTERVAL_HOURS=6
+
+# Limites de download
+YOUTUBE_MAX_DURATION=7200        # 2 horas
+YOUTUBE_MAX_FILE_SIZE=209715200  # 200MB
+YOUTUBE_QUALITY="best[ext=mp4][height<=720]/best"
+```
+
+### 🔧 Comandos YouTube
+
+```bash
+# Gerenciamento do serviço
+./scripts/youtube-start.sh    # Iniciar serviço
+./scripts/youtube-stop.sh     # Parar serviço
+./scripts/youtube-restart.sh  # Reiniciar serviço
+./scripts/youtube-logs.sh     # Ver logs
+./scripts/youtube-update.sh   # Atualizar yt-dlp
+
+# Monitoramento
+./scripts/youtube-health.sh   # Check de saúde
+./scripts/youtube-test.sh     # Teste funcional
+./scripts/youtube-monitor.sh  # Monitor contínuo
+```
+
+### 🚨 Troubleshooting YouTube
+
+```bash
+# 1. Verificar status do serviço
+./scripts/youtube-status.sh
+
+# 2. Ver logs detalhados  
+./scripts/youtube-logs.sh --follow
+
+# 3. Testar download manual
+./scripts/youtube-test.sh "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+# 4. Forçar atualização
+./scripts/youtube-update.sh --force
+
+# 5. Reset completo
+./scripts/youtube-reset.sh
+```
 
 ## 🏥 Monitoramento
 
 ### Health Checks
 ```bash
-# Liveness
+# Liveness (app principal)
 curl http://localhost:8000/health/live
 
 # Readiness (com dependências)
 curl http://localhost:8000/health/ready
+
+# YouTube Service
+curl http://localhost:8080/health
 ```
 
 ### Logs Estruturados
